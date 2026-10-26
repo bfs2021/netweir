@@ -30,7 +30,7 @@ fn main() {
         .include(source)
         .define("LEXBOR_STATIC", None)
         .warnings(false)
-        .opt_level(2);
+        .opt_level(3);
     for module in MODULES {
         add_c_files(&mut build, &source.join("lexbor").join(module));
     }
