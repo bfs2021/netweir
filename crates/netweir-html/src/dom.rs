@@ -48,8 +48,10 @@ const IN_SOURCE: u32 = 1 << 31;
 /// `start` is its index in `extras`.
 const IN_EXTRA: u32 = 1 << 30;
 
-/// The most input a document can hold: spans keep offsets in 30 bits.
-pub const MAX_INPUT: usize = 1 << 30;
+/// The most input a document can hold. Spans keep offsets in 30 bits, and
+/// the parse buffer, which only holds copies of what the input says, stays
+/// well under that.
+pub const MAX_INPUT: usize = 1 << 29;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Span {
@@ -125,9 +127,11 @@ pub struct Document {
     /// didn't need changing point into it rather than being copied.
     pub(crate) src: Box<str>,
     pub(crate) buf: String,
-    /// Strings edits add, each in an allocation of its own: an edit never
+    /// Strings with an allocation each: what edits add, and text the
+    /// parser had to keep growing away from the end of `buf`. Only the
+    /// parse grows one, so once it's done none moves, and an edit never
     /// moves a string already handed out, as growing `buf` would.
-    pub(crate) extras: Vec<Box<str>>,
+    pub(crate) extras: Vec<String>,
     pub(crate) attrs: Vec<Attr>,
     pub(crate) quirks: Quirks,
     /// Whether it was parsed with scripting on, which decides how a
@@ -216,7 +220,7 @@ impl Document {
     /// never moves, so a `&str` read before the edit stays good.
     pub(crate) fn push_stable(&mut self, s: &str) -> Span {
         let at = self.extras.len() as u32 | IN_EXTRA;
-        self.extras.push(s.into());
+        self.extras.push(s.to_owned());
         Span { start: at, end: at }
     }
 
@@ -347,15 +351,19 @@ impl Document {
                     start: span.start,
                     end: self.buf.len() as u32,
                 }
+            } else if span.start & IN_EXTRA != 0 {
+                // Already a string of its own: grows in place.
+                self.extras[(span.start & !IN_EXTRA) as usize].push_str(text);
+                span
             } else {
-                let old = self.str(span).to_owned();
-                let start = self.buf.len();
-                self.buf.push_str(&old);
-                self.buf.push_str(text);
-                Span {
-                    start: start as u32,
-                    end: self.buf.len() as u32,
-                }
+                // Something was written after it: move it to a string of its
+                // own, once, rather than copying it to the end of the buffer on
+                // every append (repeated <body x> made that quadratic).
+                let mut own = self.str(span).to_owned();
+                own.push_str(text);
+                let at = self.extras.len() as u32 | IN_EXTRA;
+                self.extras.push(own);
+                Span { start: at, end: at }
             };
         self.nodes[id as usize].data = Data::Text(span);
     }
@@ -419,25 +427,43 @@ impl Document {
     /// An element's attributes, in source order, as (namespace, local name,
     /// value).
     pub fn attrs(&self, id: NodeId) -> impl Iterator<Item = (AttrNs, &str, &str)> + '_ {
-        self.attrs_written(id).map(|(ns, name, value)| match ns {
-            AttrNs::XLink | AttrNs::Xml | AttrNs::Xmlns => (
-                ns,
-                name.split_once(':').map_or(name, |(_, local)| local),
-                value,
-            ),
-            _ => (ns, name, value),
+        self.attrs_of(id).iter().map(|a| {
+            let name = self.str(a.name);
+            let name = match a.ns {
+                AttrNs::XLink | AttrNs::Xml | AttrNs::Xmlns => {
+                    name.split_once(':').map_or(name, |(_, local)| local)
+                }
+                _ => name,
+            };
+            (a.ns, name, self.str(a.value))
         })
     }
 
     /// An element's attributes with their names as written: `xlink:href`
     /// rather than `href`, and an XML attribute's prefix kept.
     pub fn attrs_written(&self, id: NodeId) -> impl Iterator<Item = (AttrNs, &str, &str)> + '_ {
+        let ns = self.element(id).map_or(Ns::Html, |e| e.ns);
+        self.attrs_of(id)
+            .iter()
+            .map(move |a| (a.ns, self.written_name(ns, a), self.str(a.value)))
+    }
+
+    pub(crate) fn attrs_of(&self, id: NodeId) -> &[Attr] {
         let range = self
             .element(id)
             .map_or(0..0, |e| e.attrs.start as usize..e.attrs.end as usize);
-        self.attrs[range]
-            .iter()
-            .map(|a| (a.ns, self.str(a.name), self.str(a.value)))
+        &self.attrs[range]
+    }
+
+    /// An attribute's name as the spec writes it on an element in `ns`:
+    /// SVG's `viewBox` and MathML's `definitionURL` get their case back.
+    pub(crate) fn written_name(&self, ns: Ns, a: &Attr) -> &str {
+        let name = self.str(a.name);
+        match (ns, a.ns) {
+            (Ns::Svg, AttrNs::None) => crate::tree::svg_attr_name(name).unwrap_or(name),
+            (Ns::MathMl, AttrNs::None) if name == "definitionurl" => "definitionURL",
+            _ => name,
+        }
     }
 
     /// An element's name lowercased, without allocating: SVG's
@@ -458,5 +484,57 @@ impl Document {
         self.element(id)
             .filter(|e| e.tag != Tag::Other && e.ns != Ns::Xml)
             .map(|e| e.tag as u8)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{AttrNs, parse};
+
+    /// Names as tokenized, lowercase and without a prefix, from attrs();
+    /// as the spec writes them, case fixed and prefix kept, from
+    /// attrs_written() and the serializer.
+    #[test]
+    fn foreign_attributes_have_a_lowercase_name_and_a_written_one() {
+        let doc = parse(
+            "<svg viewBox=0 xmlns:xlink=x><use xlink:href=#i></use></svg>\
+             <math definitionURL=d></math>",
+            false,
+        );
+        let svg = (0..doc.len() as u32)
+            .find(|&n| doc.lower_name(n) == Some("svg"))
+            .unwrap();
+        let use_ = doc.first_child(svg).unwrap();
+        let math = doc.next_sibling(svg).unwrap();
+        let names = |n, written: bool| -> Vec<String> {
+            if written {
+                doc.attrs_written(n)
+                    .map(|(_, a, _)| a.to_string())
+                    .collect()
+            } else {
+                doc.attrs(n).map(|(_, a, _)| a.to_string()).collect()
+            }
+        };
+        assert_eq!(names(svg, false), ["viewbox", "xlink"]);
+        assert_eq!(names(svg, true), ["viewBox", "xmlns:xlink"]);
+        assert_eq!(names(use_, false), ["href"]);
+        assert_eq!(doc.attrs(use_).next().unwrap().0, AttrNs::XLink);
+        assert_eq!(names(use_, true), ["xlink:href"]);
+        assert_eq!(names(math, false), ["definitionurl"]);
+        assert_eq!(names(math, true), ["definitionURL"]);
+        assert!(doc.outer_html(svg).starts_with(r#"<svg viewBox="0""#));
+        assert!(doc.outer_html(math).contains("definitionURL"));
+    }
+
+    #[test]
+    fn an_edit_finds_a_foreign_attribute_by_its_written_name() {
+        let mut doc = parse("<svg viewBox=0></svg>", false);
+        let svg = (0..doc.len() as u32)
+            .find(|&n| doc.lower_name(n) == Some("svg"))
+            .unwrap();
+        doc.set_attr(svg, "viewBox", "1");
+        assert_eq!(doc.outer_html(svg), r#"<svg viewBox="1"></svg>"#);
+        assert!(doc.remove_attr(svg, "viewBox"));
+        assert_eq!(doc.outer_html(svg), "<svg></svg>");
     }
 }

@@ -9,8 +9,7 @@ use netweir_html as html;
 
 use crate::document::{Document, Node};
 
-/// The node kinds, as the index stores them (lexbor's numbers, which the
-/// XPath engine's tests compare against).
+/// The node kinds, as the index stores them: the DOM's nodeType numbers.
 pub(crate) const ELEMENT: u8 = 0x01;
 pub(crate) const TEXT: u8 = 0x03;
 pub(crate) const CDATA: u8 = 0x04;
@@ -56,7 +55,13 @@ pub(crate) fn kind_of(tree: &html::Document, id: u32) -> u8 {
 /// An element's name for tag ids: lowercase, without an XML prefix.
 fn tag_key(tree: &html::Document, id: u32) -> &str {
     let name = tree.lower_name(id).unwrap_or("");
-    name.split_once(':').map_or(name, |(_, local)| local)
+    // Only XML has prefixes: in HTML, <o:p> is an element called "o:p".
+    match tree.kind(id) {
+        html::Kind::Element {
+            ns: html::Ns::Xml, ..
+        } => name.split_once(':').map_or(name, |(_, local)| local),
+        _ => name,
+    }
 }
 
 impl Index {
@@ -204,7 +209,7 @@ impl Index {
 
     /// The nodes in `at`'s tree, other than `at`, of its kind and tag and
     /// with the same tags all the way up, that pass `keep`, in document
-    /// order. Tags are compared as lexbor's ids, so the scan is integer
+    /// order. Tags are compared as ids, so the scan is integer
     /// work until `keep` runs.
     pub(crate) fn same_path<'a>(
         &self,

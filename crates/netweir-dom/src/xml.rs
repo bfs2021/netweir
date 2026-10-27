@@ -1,5 +1,5 @@
 //! XML documents. quick-xml reads the markup and this module builds the
-//! tree in lexbor, as an HTML page's is built, so CSS, XPath, `get()` and
+//! tree in the same arena as an HTML page's, so CSS, XPath, `get()` and
 //! the rest of the API work on a feed or a sitemap as they do on a page.
 //!
 //! XML is a trust boundary, and parsing treats it as one:
@@ -87,15 +87,15 @@ impl fmt::Display for ParseXmlError {
 
 impl std::error::Error for ParseXmlError {}
 
-/// What an XML document knows that lexbor doesn't keep: namespaces.
-/// lexbor folds namespace URIs to lowercase, and XML compares them as
-/// written, so they live here, keyed by node.
+/// What an XML document knows that the HTML tree has no place for:
+/// element namespaces, compared as written, keyed by node.
 #[derive(Default)]
 pub(crate) struct XmlNames {
     /// Namespace URIs; id `i` is `uris[i - 1]`, and 0 is no namespace.
     uris: Vec<Box<str>>,
     ids: HashMap<Box<str>, u32>,
-    /// The namespace of each element or attribute that has one.
+    /// The namespace of each element that has one. (An attribute carries
+    /// its own, as `AttrNs::Host`.)
     ns: HashMap<usize, u32>,
     /// The `xmlns` declarations each element makes, in order: a prefix
     /// ("" for the default namespace) and a URI id (0 for `xmlns=""`).
@@ -137,7 +137,7 @@ impl XmlNames {
         }
     }
 
-    /// The namespace id of the element or attribute at `raw`.
+    /// The namespace id of the element at `raw`.
     pub(crate) fn ns_of(&self, raw: usize) -> u32 {
         self.ns.get(&raw).copied().unwrap_or(0)
     }

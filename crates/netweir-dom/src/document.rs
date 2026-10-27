@@ -21,7 +21,8 @@ pub struct Document {
     /// The tree. Readers share it; an edit, which has the document to
     /// itself (see `edit`), is the only thing that changes it.
     tree: UnsafeCell<html::Document>,
-    /// For an XML document, its namespaces (which lexbor can't keep).
+    /// For an XML document, its namespaces (the HTML tree has no place
+    /// for them).
     /// Only an edit changes them, as with the index.
     xml: UnsafeCell<Option<Box<XmlNames>>>,
     /// A flat, document-order index of every node, built on first use and
@@ -204,10 +205,9 @@ impl Document {
 
     /// Like [`Document::parse`], but gives up once `budget` has passed.
     ///
-    /// The HTML5 spec makes some inputs, such as thousands of unclosed
-    /// `<div>`s, take time quadratic in their nesting depth. A 400 KB page of
-    /// them takes seconds. Browsers cap the depth; lexbor does not. A crawler
-    /// fetching pages it does not control should parse with a budget.
+    /// The HTML5 spec makes some inputs take time quadratic in their size.
+    /// A crawler fetching pages it does not control should parse with a
+    /// budget.
     pub fn parse_within(html: &str, budget: Duration) -> Result<Document, ParseTimeout> {
         let options = html::Options {
             scripting: false,
@@ -854,10 +854,13 @@ impl Document {
                     doc: self,
                     id: root,
                 };
-                for n in std::iter::once(top).chain(top.descendants()) {
-                    if n.kind() == NodeKind::Element {
-                        unsafe { strip_prefixes(self, n.id) };
-                    }
+                let elements: Vec<u32> = std::iter::once(top)
+                    .chain(top.descendants())
+                    .filter(|n| n.kind() == NodeKind::Element)
+                    .map(|n| n.id)
+                    .collect();
+                for n in elements {
+                    unsafe { strip_prefixes(self, n) };
                 }
             }
             // SAFETY: this edit has the document to itself.
@@ -1037,11 +1040,12 @@ impl<'a> Node<'a> {
         }
     }
 
-    /// An element's attributes with what XPath needs of them: the name as
-    /// written, its namespace id (0 for none, and in HTML) and the value.
+    /// An element's attributes with what XPath needs of them: the name
+    /// (as written in XML, as [`Node::attrs`] gives it in HTML), its
+    /// namespace id (0 for none, and in HTML) and the value.
     pub(crate) fn xml_attrs(&self) -> Vec<(&'a str, u32, &'a str)> {
         self.tree()
-            .attrs_written(self.id)
+            .attrs(self.id)
             .map(|(ns, name, value)| {
                 let ns = match ns {
                     html::AttrNs::Host(id) => id,
@@ -1053,7 +1057,7 @@ impl<'a> Node<'a> {
     }
 
     pub fn attr(&self, name: &str) -> Option<&'a str> {
-        let mut attrs = self.tree().attrs_written(self.id);
+        let mut attrs = self.tree().attrs(self.id);
         if self.doc.is_xml() {
             return attrs.find(|(_, n, _)| *n == name).map(|(_, _, v)| v);
         }
@@ -1064,10 +1068,12 @@ impl<'a> Node<'a> {
     }
 
     /// Every attribute as `(name, value)`, in source order. In XML a name
-    /// keeps its prefix as written (`xml:lang`).
+    /// keeps its prefix as written (`xml:lang`). In HTML, lowercase as
+    /// tokenized (SVG's `viewbox`, as lxml has it), and a namespaced one
+    /// by its local name (`href` for `xlink:href`).
     pub fn attrs(&self) -> Vec<(&'a str, &'a str)> {
         self.tree()
-            .attrs_written(self.id)
+            .attrs(self.id)
             .map(|(_, name, value)| (name, value))
             .collect()
     }
@@ -1230,18 +1236,24 @@ impl<'a> Node<'a> {
     }
 
     pub fn children(&self) -> impl Iterator<Item = Node<'a>> + use<'a> {
+        // The tree is looked up afresh at each step: an edit on this
+        // thread may change it between them.
         let doc = self.doc;
-        let tree = self.tree();
-        tree.children(self.id).map(move |id| Node { doc, id })
+        let mut next = doc.tree().first_child(self.id);
+        std::iter::from_fn(move || {
+            let id = next?;
+            next = doc.tree().next_sibling(id);
+            Some(Node { doc, id })
+        })
     }
 
     /// Every node below this one, in document order.
     pub fn descendants(&self) -> impl Iterator<Item = Node<'a>> + use<'a> {
         let doc = self.doc;
-        let tree = self.tree();
         let top = self.id;
-        let mut next = tree.first_child(top);
+        let mut next = doc.tree().first_child(top);
         std::iter::from_fn(move || {
+            let tree = doc.tree();
             let current = next?;
             next = tree.first_child(current);
             let mut up = Some(current);

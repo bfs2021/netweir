@@ -33,29 +33,7 @@ impl Document {
     /// A new element, not yet in the tree. HTML names are lowercased, as
     /// `createElement` does.
     pub fn create_element(&mut self, ns: Ns, name: &str) -> NodeId {
-        let lower = name.to_ascii_lowercase();
-        let (tag, name) = match ns {
-            Ns::Html => {
-                let tag = Tag::from_name(&lower);
-                let name = if tag == Tag::Other {
-                    Name::Span(self.push_stable(&lower))
-                } else {
-                    Name::Tag
-                };
-                (tag, name)
-            }
-            // An XML element is never an HTML one, whatever its name.
-            Ns::Xml => (Tag::Other, Name::Span(self.push_stable(name))),
-            _ => {
-                let tag = Tag::from_name(&lower);
-                let name = if tag != Tag::Other && tag.name() == name {
-                    Name::Tag
-                } else {
-                    Name::Span(self.push_stable(name))
-                };
-                (tag, name)
-            }
-        };
+        let (tag, name) = self.name_element(ns, name);
         let at = self.attrs.len() as u32;
         let contents = if ns == Ns::Html && tag == Tag::Template {
             self.add(Data::Fragment)
@@ -159,10 +137,12 @@ impl Document {
     /// attribute names are lowercased, as `setAttribute` does.
     pub fn set_attr(&mut self, id: NodeId, name: &str, value: &str) {
         let Some(e) = self.element(id) else { return };
-        let name = if e.ns == Ns::Html {
-            name.to_ascii_lowercase()
-        } else {
+        // As the parser stores them: lowercase outside XML, with SVG's
+        // and MathML's case put back when written.
+        let name = if e.ns == Ns::Xml {
             name.to_string()
+        } else {
+            name.to_ascii_lowercase()
         };
         let value = self.push_stable(value);
         let name_span = self.push_stable(&name);
@@ -228,23 +208,38 @@ impl Document {
         let Some(e) = self.element(id).copied() else {
             return;
         };
-        let (tag, new) = match e.ns {
-            Ns::Xml => (Tag::Other, Name::Span(self.push_stable(name))),
+        let (tag, new) = self.name_element(e.ns, name);
+        if let Data::Element(e) = &mut self.nodes[id as usize].data {
+            e.tag = tag;
+            e.name = new;
+        }
+    }
+
+    /// The tag and stored name of an element called `name` in `ns`. HTML
+    /// names are lowercased; foreign ones keep their case.
+    fn name_element(&mut self, ns: Ns, name: &str) -> (Tag, Name) {
+        let lower = name.to_ascii_lowercase();
+        match ns {
             Ns::Html => {
-                let lower = name.to_ascii_lowercase();
                 let tag = Tag::from_name(&lower);
-                let new = if tag == Tag::Other {
+                let name = if tag == Tag::Other {
                     Name::Span(self.push_stable(&lower))
                 } else {
                     Name::Tag
                 };
-                (tag, new)
+                (tag, name)
             }
-            _ => (e.tag, Name::Span(self.push_stable(name))),
-        };
-        if let Data::Element(e) = &mut self.nodes[id as usize].data {
-            e.tag = tag;
-            e.name = new;
+            // An XML element is never an HTML one, whatever its name.
+            Ns::Xml => (Tag::Other, Name::Span(self.push_stable(name))),
+            _ => {
+                let tag = Tag::from_name(&lower);
+                let name = if tag != Tag::Other && tag.name() == name {
+                    Name::Tag
+                } else {
+                    Name::Span(self.push_stable(name))
+                };
+                (tag, name)
+            }
         }
     }
 
@@ -278,10 +273,12 @@ impl Document {
         let Some(e) = self.element(id) else {
             return false;
         };
-        let name = if e.ns == Ns::Html {
-            name.to_ascii_lowercase()
-        } else {
+        // As the parser stores them: lowercase outside XML, with SVG's
+        // and MathML's case put back when written.
+        let name = if e.ns == Ns::Xml {
             name.to_string()
+        } else {
+            name.to_ascii_lowercase()
         };
         self.rewrite_attrs(id, |doc, attrs| {
             let before = attrs.len();
@@ -339,6 +336,19 @@ mod tests {
         assert_eq!(doc.inner_html(0), "<p>a</p>");
         doc.append(0, second).unwrap();
         assert_eq!(doc.inner_html(0), "<p>a</p><p>b<em>x &amp; y</em></p>");
+    }
+
+    #[test]
+    fn a_renamed_foreign_element_takes_its_new_names_tag() {
+        let mut doc = parse_fragment("", Ns::Html, "div", false);
+        let svg_title = doc.create_element(Ns::Svg, "title");
+        let title_tag = doc.known_tag(svg_title);
+        assert!(title_tag.is_some());
+        let n = doc.create_element(Ns::Svg, "rect");
+        doc.rename(n, "title");
+        assert_eq!(doc.known_tag(n), title_tag);
+        doc.rename(n, "rect");
+        assert_eq!(doc.known_tag(n), None);
     }
 
     #[test]

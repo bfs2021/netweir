@@ -45,100 +45,118 @@ impl Document {
         out
     }
 
+    /// Writes `id`'s children; with a stack of its own rather than
+    /// recursion, so a tree as deep as any page makes can't overflow it.
     fn children_html(&self, id: NodeId, out: &mut String) {
-        if let Some(e) = self.element(id) {
-            if void(e) {
-                return;
-            }
-            // A template's contents, then any children it has, which it only
-            // has once adopt_template_contents has moved its contents in.
-            if e.ns == Ns::Html && e.tag == Tag::Template && e.contents != crate::dom::NONE {
-                self.children_html(e.contents, out);
-            }
+        if self.element(id).is_some_and(void) {
+            return;
         }
-        let mut child = self.nodes[id as usize].first_child;
-        while child != crate::dom::NONE {
-            self.node_html(child, out);
-            child = self.nodes[child as usize].next;
-        }
+        let mut stack = Vec::new();
+        self.push_children(id, &mut stack);
+        self.write(stack, out);
     }
 
     fn node_html(&self, id: NodeId, out: &mut String) {
-        match &self.nodes[id as usize].data {
-            Data::Element(e) => {
-                let name = self.element_name(e);
-                out.push('<');
-                out.push_str(name);
-                // Names as written are the spec's serialized names:
-                // `xlink:href`, `xml:lang`, `xmlns`.
-                for (_, name, value) in self.attrs_written(id) {
-                    out.push(' ');
-                    out.push_str(name);
-                    out.push_str("=\"");
-                    escape(value, true, out);
-                    out.push('"');
-                }
-                out.push('>');
-                if void(e) {
-                    return;
-                }
-                self.children_html(id, out);
-                out.push_str("</");
-                out.push_str(name);
-                out.push('>');
-            }
-            Data::Text(span) => {
-                let text = self.str(*span);
-                if self.raw_text_parent(id) {
-                    out.push_str(text);
-                } else {
-                    escape(text, false, out);
-                }
-            }
-            Data::Comment(span) => {
-                out.push_str("<!--");
-                out.push_str(self.str(*span));
-                out.push_str("-->");
-            }
-            Data::ProcessingInstruction { target, data } => {
-                out.push_str("<?");
-                out.push_str(self.str(*target));
-                out.push(' ');
-                out.push_str(self.str(*data));
-                out.push_str("?>");
-            }
-            Data::Cdata(span) => {
-                out.push_str("<![CDATA[");
-                out.push_str(self.str(*span));
-                out.push_str("]]>");
-            }
-            Data::Doctype { name, .. } => {
-                out.push_str("<!DOCTYPE ");
-                out.push_str(self.str(*name));
-                out.push('>');
-            }
-            Data::Document | Data::Fragment => self.children_html(id, out),
+        self.write(vec![(id, false)], out);
+    }
+
+    /// `id`'s children onto the stack, the first on top: a template's
+    /// contents first, then any children it has, which it only has once
+    /// adopt_template_contents has moved its contents in.
+    fn push_children(&self, id: NodeId, stack: &mut Vec<(NodeId, bool)>) {
+        let at = stack.len();
+        stack.extend(self.children(id).map(|c| (c, false)));
+        if let Some(e) = self.element(id)
+            && e.ns == Ns::Html
+            && e.tag == Tag::Template
+            && e.contents != crate::dom::NONE
+        {
+            stack.extend(self.children(e.contents).map(|c| (c, false)));
         }
+        stack[at..].reverse();
+    }
+
+    /// Writes what's on the stack: a node, or with `true` an element's end
+    /// tag, once its children are written.
+    fn write(&self, mut stack: Vec<(NodeId, bool)>, out: &mut String) {
+        while let Some((id, end)) = stack.pop() {
+            let data = &self.nodes[id as usize].data;
+            if end {
+                if let Data::Element(e) = data {
+                    out.push_str("</");
+                    out.push_str(self.element_name(e));
+                    out.push('>');
+                }
+                continue;
+            }
+            match data {
+                Data::Element(e) => {
+                    self.start_tag(id, out);
+                    if void(e) {
+                        continue;
+                    }
+                    stack.push((id, true));
+                    self.push_children(id, &mut stack);
+                }
+                Data::Text(span) => {
+                    let text = self.str(*span);
+                    if self.raw_text_parent(id) {
+                        out.push_str(text);
+                    } else {
+                        escape(text, false, out);
+                    }
+                }
+                Data::Comment(span) => {
+                    out.push_str("<!--");
+                    out.push_str(self.str(*span));
+                    out.push_str("-->");
+                }
+                Data::ProcessingInstruction { target, data } => {
+                    out.push_str("<?");
+                    out.push_str(self.str(*target));
+                    out.push(' ');
+                    out.push_str(self.str(*data));
+                    out.push_str("?>");
+                }
+                Data::Cdata(span) => {
+                    out.push_str("<![CDATA[");
+                    out.push_str(self.str(*span));
+                    out.push_str("]]>");
+                }
+                Data::Doctype { name, .. } => {
+                    out.push_str("<!DOCTYPE ");
+                    out.push_str(self.str(*name));
+                    out.push('>');
+                }
+                Data::Document | Data::Fragment => self.push_children(id, &mut stack),
+            }
+        }
+    }
+
+    fn start_tag(&self, id: NodeId, out: &mut String) {
+        let Some(e) = self.element(id) else { return };
+        out.push('<');
+        out.push_str(self.element_name(e));
+        // Names as written are the spec's serialized names:
+        // `xlink:href`, `xml:lang`, `xmlns`.
+        for (_, name, value) in self.attrs_written(id) {
+            out.push(' ');
+            out.push_str(name);
+            out.push_str("=\"");
+            escape(value, true, out);
+            out.push('"');
+        }
+        out.push('>');
     }
 
     /// The node alone: an element's start tag, escaped text, a comment
     /// or a doctype; as `outer_html` writes it, without the children.
     pub fn html_alone(&self, id: NodeId) -> String {
         let mut out = String::new();
-        match &self.nodes[id as usize].data {
-            Data::Element(e) => {
-                out.push('<');
-                out.push_str(self.element_name(e));
-                for (_, name, value) in self.attrs_written(id) {
-                    out.push(' ');
-                    out.push_str(name);
-                    out.push_str("=\"");
-                    escape(value, true, &mut out);
-                    out.push('"');
-                }
-                out.push('>');
-            }
-            _ => self.node_html(id, &mut out),
+        if self.element(id).is_some() {
+            self.start_tag(id, &mut out);
+        } else {
+            self.node_html(id, &mut out);
         }
         out
     }
@@ -278,5 +296,28 @@ mod tests {
     fn text_content_joins_every_text_node() {
         let doc = parse("<p>a<b>b</b>c</p>", false);
         assert!(doc.text(0).ends_with("abc"));
+    }
+}
+
+#[cfg(test)]
+mod deep {
+    /// Serializing recursed once per level and overflowed the stack on deep
+    /// pages; Netweir parses on threads with 2 MB stacks.
+    #[test]
+    fn deep_trees_serialize_on_a_small_stack() {
+        let html = "<div>".repeat(20_000);
+        let out = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let doc = crate::parse(&html, false);
+                doc.inner_html(0).len()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(
+            out,
+            "<html><head></head><body></body></html>".len() + 20_000 * 11
+        );
     }
 }

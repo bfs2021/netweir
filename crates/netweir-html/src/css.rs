@@ -139,7 +139,15 @@ enum Pseudo {
 struct Parser<'a> {
     s: &'a str,
     pos: usize,
+    /// How deep in `:not()`, `:is()` and the like it is; parsing and
+    /// matching both recurse, so a limit keeps a pathological selector
+    /// from overflowing the stack.
+    depth: u32,
 }
+
+/// Nesting deeper than any real selector, and shallow enough for a
+/// thread's stack.
+const MAX_DEPTH: u32 = 32;
 
 fn is_name_start(c: char) -> bool {
     c.is_ascii_alphabetic() || c == '_' || !c.is_ascii()
@@ -561,6 +569,16 @@ impl<'a> Parser<'a> {
     }
 
     fn pseudo_function(&mut self, name: &str) -> Result<Pseudo, SelectorError> {
+        if self.depth >= MAX_DEPTH {
+            return error(format!("selectors nest more than {MAX_DEPTH} deep"));
+        }
+        self.depth += 1;
+        let result = self.pseudo_function_body(name);
+        self.depth -= 1;
+        result
+    }
+
+    fn pseudo_function_body(&mut self, name: &str) -> Result<Pseudo, SelectorError> {
         Ok(match name {
             "not" => Pseudo::Not(self.selector_list(false)?),
             "is" | "where" | "matches" => Pseudo::Is(self.selector_list(true)?),
@@ -586,7 +604,9 @@ impl<'a> Parser<'a> {
                     None => (arg, None),
                 };
                 let (a, b) = an_plus_b(anb)?;
-                let of = rest.map(SelectorList::parse).transpose()?;
+                let of = rest
+                    .map(|rest| SelectorList::parse_at(rest, self.depth))
+                    .transpose()?;
                 self.pos = close;
                 Pseudo::Nth {
                     a,
@@ -701,9 +721,14 @@ fn nth(a: i32, b: i32, last: bool, of_type: bool) -> Pseudo {
 
 impl SelectorList {
     pub fn parse(selector: &str) -> Result<SelectorList, SelectorError> {
+        SelectorList::parse_at(selector, 0)
+    }
+
+    fn parse_at(selector: &str, depth: u32) -> Result<SelectorList, SelectorError> {
         let mut p = Parser {
             s: selector,
             pos: 0,
+            depth,
         };
         let list = p.selector_list(false)?;
         p.skip_space();
@@ -963,13 +988,11 @@ impl Cx<'_> {
             Case::Default => html && case_insensitive_attr(&a.lower),
         };
         let want = if html { &a.lower } else { &a.exact };
-        let range = doc
-            .element(el)
-            .map_or(0..0, |e| e.attrs.start as usize..e.attrs.end as usize);
         // The raw attributes, so a value is only looked at once the name
         // matches.
-        doc.attrs[range].iter().any(|attr| {
-            let name = doc.str(attr.name);
+        doc.attrs_of(el).iter().any(|attr| {
+            // A browser matches SVG's `viewBox` with its case.
+            let name = doc.written_name(ns, attr);
             // A namespaced attribute is stored as written (`xlink:href`);
             // `[*|href]` names its local part.
             let name = match attr.ns {

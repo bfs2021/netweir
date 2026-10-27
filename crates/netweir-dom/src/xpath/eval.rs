@@ -263,7 +263,7 @@ fn eval_here<'a>(expr: &Expr, ctx: &Context<'a, '_>) -> Result<Value<'a>> {
 }
 
 fn in_document_order(items: Vec<Item<'_>>) -> Vec<Item<'_>> {
-    // A key costs a call into lexbor, so each is read once.
+    // A key costs an index lookup, so each is read once.
     let mut keyed: Vec<_> = items.into_iter().map(|i| (i.key(), i)).collect();
     keyed.sort_unstable_by_key(|(k, _)| *k);
     keyed.dedup_by_key(|(k, _)| *k);
@@ -311,7 +311,7 @@ fn walk<'a>(
             let mut done = 0;
             match (item, test.indexable()) {
                 // Child and descendant steps on names, *, text() and node()
-                // scan the document index instead of walking lexbor's nodes.
+                // scan the document index instead of walking the tree.
                 (Item::Node(n), true)
                     if matches!(
                         step.axis,
@@ -444,7 +444,7 @@ fn quick_predicate(pred: &Expr, item: &Item<'_>) -> Option<bool> {
                     test: NodeTest::Name(n),
                     predicates,
                 },
-                // lexbor folds case when looking an attribute up by name, but
+                // Node::attr folds case when looking an attribute up, but
                 // XPath names are case-sensitive and HTML attribute names are
                 // stored lowercase: leave capitals to the general path.
             ] if predicates.is_empty() && !n.bytes().any(|b| b.is_ascii_uppercase()) => {
@@ -526,7 +526,7 @@ fn namespace<'c>(prefix: &str, ctx: &'c Context<'_, '_>) -> Result<&'c str> {
         })
 }
 
-/// A node test made ready for one document: names become lexbor tag ids,
+/// A node test made ready for one document: names become tag ids,
 /// so matching an element is one integer comparison.
 enum Test<'t> {
     Node,
@@ -539,11 +539,11 @@ enum Test<'t> {
     AnyElement,
     AnyAttribute,
     ElementId(usize),
-    /// A name with capitals: no HTML element has one (lexbor lowercases
+    /// A name with capitals: no HTML element has one (the parser lowercases
     /// them), but SVG and MathML elements can, so compare the text.
     ElementName(&'t str),
     AttributeName(&'t str),
-    /// An XML element by namespace and local name. `id` is lexbor's id
+    /// An XML element by namespace and local name. `id` is the index's id
     /// for the lowercased name, which the index can check first; the case
     /// and namespace are checked after.
     XmlElement {
@@ -640,7 +640,7 @@ impl<'t> Test<'t> {
         matches!(self, Test::XmlElement { .. })
     }
 
-    /// The test, from a node's lexbor type and tag id.
+    /// The test, from a node's kind and tag id.
     fn keeps(&self, kind: u8, tag: usize) -> bool {
         const ELEMENT: u8 = 0x01;
         const TEXT: u8 = 0x03;

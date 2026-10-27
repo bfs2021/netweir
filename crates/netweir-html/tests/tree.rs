@@ -120,9 +120,10 @@ fn serialize(doc: &Document, node: NodeId, depth: usize, out: &mut Vec<String>) 
                 out.push(format!("| {pad}<{prefix}{name}>"));
                 let mut attrs: Vec<String> = doc
                     .attrs(child)
-                    .map(|(ns, local, value)| {
+                    .zip(doc.attrs_written(child))
+                    .map(|((ns, local, value), (_, written, _))| {
                         let name = match ns {
-                            AttrNs::None => local.to_string(),
+                            AttrNs::None => written.to_string(),
                             AttrNs::XLink => format!("xlink {local}"),
                             AttrNs::Xml => format!("xml {local}"),
                             AttrNs::Xmlns if local == "xmlns" => "xmlns".to_string(),

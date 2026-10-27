@@ -330,7 +330,7 @@ fn svg_tag_name(name: &str) -> Option<u8> {
 }
 
 /// SVG attribute names whose case the parser fixes.
-fn svg_attr_name(name: &str) -> Option<&'static str> {
+pub(crate) fn svg_attr_name(name: &str) -> Option<&'static str> {
     Some(match name {
         "attributename" => "attributeName",
         "attributetype" => "attributeType",
@@ -950,11 +950,9 @@ impl TreeBuilder {
                 // Kept as written (`xlink:href`); attrs() gives the local
                 // name, attrs_written() this.
                 (attr_ns, n)
-            } else if ns == Ns::Svg {
-                (AttrNs::None, svg_attr_name(n).unwrap_or(n))
-            } else if n == "definitionurl" {
-                (AttrNs::None, "definitionURL")
             } else {
+                // Lowercase as tokenized: attrs_written() fixes SVG's and
+                // MathML's case.
                 (AttrNs::None, n)
             };
             if ns == Ns::MathMl
@@ -2898,8 +2896,9 @@ fn run(html: &str, options: Options, fragment: Option<(Ns, &str)>) -> Result<Doc
     if let Some(mode) = mode {
         tokenizer.set_text_mode(mode);
     }
-    if let Some(budget) = options.budget {
-        tokenizer.set_deadline(start + budget);
+    // A budget past what the clock can count is no limit at all.
+    if let Some(deadline) = options.budget.and_then(|b| start.checked_add(b)) {
+        tokenizer.set_deadline(deadline);
     }
     tokenizer.run(&mut builder);
     if tokenizer.timed_out() {
@@ -2949,5 +2948,31 @@ mod tests {
             ..Options::default()
         };
         assert!(parse_with(&html, roomy).is_ok());
+    }
+    #[test]
+    fn a_budget_too_big_for_the_clock_is_no_limit() {
+        let endless = Options {
+            budget: Some(Duration::MAX),
+            ..Options::default()
+        };
+        assert!(parse_with("<p>x", endless).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod hostile {
+    use super::*;
+
+    /// Each `<body X>` merges an attribute (copied into the parse buffer)
+    /// and then text goes back into the same text node, so a text node
+    /// copied whole on every append grew the buffer quadratically: 310 KB
+    /// reached 1 GB and panicked.
+    #[test]
+    fn text_split_by_merged_attributes_costs_linear_memory() {
+        let tail: String = (0..11_000).map(|i| format!("<body X{i}>b")).collect();
+        let html = format!("<body>a&amp;{}{tail}", "x".repeat(100_000));
+        let doc = parse(&html, false);
+        assert!(doc.buf.len() + doc.extras.iter().map(|e| e.len()).sum::<usize>() < 4 * html.len());
+        assert!(doc.text(0).ends_with('b'));
     }
 }

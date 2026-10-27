@@ -210,3 +210,29 @@ fn bad_selectors_are_errors() {
         assert!(SelectorList::parse(bad).is_err(), "{bad:?} parsed");
     }
 }
+
+/// Each nesting recursed in the parser, so a deep enough selector
+/// overflowed the stack and aborted the process; it's an error instead.
+#[test]
+fn deeply_nested_selectors_are_errors_not_crashes() {
+    let result = std::thread::Builder::new()
+        .stack_size(512 * 1024)
+        .spawn(|| {
+            let not = format!("{}a{}", ":not(".repeat(20_000), ")".repeat(20_000));
+            let is = format!("{}a{}", ":is(".repeat(5_000), ")".repeat(5_000));
+            {
+                // :is() forgives what it can't parse, so the too-deep part
+                // is dropped rather than failing the list: what matters is
+                // that neither overflows.
+                let _ = SelectorList::parse(&is);
+                (SelectorList::parse(&not).is_err(), true)
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(result, (true, true));
+    // Reasonable nesting still works.
+    let ok = format!("{}a{}", ":not(".repeat(20), ")".repeat(20));
+    assert!(SelectorList::parse(&ok).is_ok());
+}

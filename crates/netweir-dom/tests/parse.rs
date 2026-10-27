@@ -299,3 +299,34 @@ fn template_contents_are_the_templates_children() {
         "<template><p class=\"x\">in</p>tx<template><i>deep</i></template></template>"
     );
 }
+
+/// As lexbor gave them: SVG attributes lowercase, and a namespaced one by
+/// its local name, so `xlink:href` answers to `href`.
+#[test]
+fn foreign_attributes_go_by_their_lowercase_local_names() {
+    let doc = Document::parse(r##"<svg viewBox="0 0 1 1"><use xlink:href="#i"></use></svg>"##);
+    let svg = doc
+        .root()
+        .descendants()
+        .find(|n| n.tag() == Some("svg"))
+        .unwrap();
+    let use_ = svg.children().next().unwrap();
+    assert_eq!(svg.attrs(), [("viewbox", "0 0 1 1")]);
+    assert_eq!(svg.attr("viewBox"), Some("0 0 1 1"));
+    assert_eq!(use_.attrs(), [("href", "#i")]);
+    assert_eq!(use_.attr("href"), Some("#i"));
+    let q = netweir_dom::Query::new("use::attr(href)").unwrap();
+    assert_eq!(q.strings(doc.root()), ["#i"]);
+    for (path, want) in [("//use/@href", "#i"), ("//svg/@viewbox", "0 0 1 1")] {
+        let hits = netweir_dom::XPath::new(path)
+            .unwrap()
+            .run(doc.root())
+            .unwrap();
+        let got: Vec<String> = hits.iter().map(netweir_dom::Hit::to_string_value).collect();
+        assert_eq!(got, [want], "{path}");
+    }
+    assert!(
+        svg.html()
+            .starts_with(r#"<svg viewBox="0 0 1 1"><use xlink:href="#)
+    );
+}
