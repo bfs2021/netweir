@@ -16,7 +16,14 @@ rows = sorted((name[1:], "".join(map(chr, v["codepoints"]))) for name, v in tabl
 
 
 def lit(s):
-    return '"' + "".join(c if c.isascii() and c.isprintable() and c not in '"\\' else f"\\u{{{ord(c):x}}}" for c in s) + '"'
+    return (
+        '"'
+        + "".join(
+            c if c.isascii() and c.isprintable() and c not in '"\\' else f"\\u{{{ord(c):x}}}"
+            for c in s
+        )
+        + '"'
+    )
 
 
 with open("src/entities.rs", "w") as out:
