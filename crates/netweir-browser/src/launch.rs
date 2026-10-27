@@ -2,7 +2,7 @@
 
 use std::io::{PipeReader, PipeWriter};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::{Error, Result};
@@ -651,7 +651,7 @@ pub(crate) fn check_profile(executable: &Path, dir: &Path) -> Result<()> {
 }
 
 impl Said {
-    fn read(stderr: ChildStderr) -> Said {
+    fn read(stderr: PipeReader) -> Said {
         let said = Said::default();
         let writing = said.clone();
         let _ = std::thread::Builder::new()
@@ -793,12 +793,15 @@ pub(crate) fn start(executable: &Path, args: &[String]) -> Result<Started> {
     // Chrome reads commands from one pipe and writes replies to the other.
     let (chrome_reads, commands) = pipe().map_err(failed)?;
     let (replies, chrome_writes) = pipe().map_err(failed)?;
+    // Its stderr too, so no process started meanwhile keeps the writing
+    // end and Said waits on it after Chrome has gone.
+    let (stderr, chrome_says) = pipe().map_err(failed)?;
     let mut command = Command::new(executable);
     command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::from(chrome_says));
     // In a group of its own, which its helpers join: what the watcher
     // ends (see tie).
     #[cfg(unix)]
@@ -815,22 +818,25 @@ pub(crate) fn start(executable: &Path, args: &[String]) -> Result<Started> {
     // turns through that window, and each starts its watcher in its own
     // turn: a watcher started during another launch's window took that
     // Chrome's ends and kept them for as long as it ran.
-    let (mut child, lifeline) = {
+    let (child, lifeline) = {
         let _turn = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
         hand_over(&mut command, &chrome_reads, &chrome_writes).map_err(failed)?;
         let child = command.spawn().map_err(failed)?;
-        // Our copies of Chrome's ends must close, or we'd never see it exit.
-        drop((chrome_reads, chrome_writes));
+        // Our copies of Chrome's ends must close, or we'd never see it exit;
+        // the command holds its stderr's.
+        drop((chrome_reads, chrome_writes, command));
         let lifeline = tie(&child);
         (child, lifeline)
     };
+    #[cfg(windows)]
+    let mut child = child;
     #[cfg(windows)]
     if let Err(e) = resume(&child) {
         let _ = child.kill();
         let _ = child.wait();
         return Err(failed(e));
     }
-    let said = child.stderr.take().map(Said::read).unwrap_or_default();
+    let said = Said::read(stderr);
     Ok(Started {
         child,
         commands,
