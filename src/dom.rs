@@ -112,6 +112,9 @@ pub struct Document {
     pub(crate) buf: String,
     pub(crate) attrs: Vec<Attr>,
     pub(crate) quirks: Quirks,
+    /// Whether it was parsed with scripting on, which decides how a
+    /// noscript element's text serializes.
+    pub(crate) scripting: bool,
 }
 
 /// What a node is, as [`Document::kind`] reports it.
@@ -153,6 +156,7 @@ impl Document {
             buf: String::with_capacity(capacity / 8),
             attrs: Vec::with_capacity(capacity / 32 + 16),
             quirks: Quirks::No,
+            scripting: false,
         }
     }
 

@@ -2800,6 +2800,7 @@ impl Sink for TreeBuilder {
 /// Parses a whole document.
 pub fn parse(html: &str, scripting: bool) -> Document {
     let mut builder = TreeBuilder::new(html.len(), scripting);
+    builder.doc.scripting = scripting;
     let input = source(&mut builder, html);
     Tokenizer::new(input).run(&mut builder);
     builder.doc
@@ -2809,6 +2810,7 @@ pub fn parse(html: &str, scripting: bool) -> Document {
 /// namespace `ns`, as `innerHTML` does.
 pub fn parse_fragment(html: &str, ns: Ns, context: &str, scripting: bool) -> Document {
     let mut builder = TreeBuilder::new(html.len(), scripting);
+    builder.doc.scripting = scripting;
     let input = source(&mut builder, html);
     let mode = builder.fragment(ns, context);
     let mut tokenizer = Tokenizer::new(input);

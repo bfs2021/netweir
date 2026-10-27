@@ -3,6 +3,7 @@
 
 mod dom;
 mod entities;
+mod serialize;
 mod tags;
 pub mod tokenizer;
 mod tree;
