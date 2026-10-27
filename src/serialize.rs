@@ -50,8 +50,10 @@ impl Document {
             if void(e) {
                 return;
             }
+            // A template's contents, then any children it has, which it only
+            // has once adopt_template_contents has moved its contents in.
             if e.ns == Ns::Html && e.tag == Tag::Template && e.contents != crate::dom::NONE {
-                return self.children_html(e.contents, out);
+                self.children_html(e.contents, out);
             }
         }
         let mut child = self.nodes[id as usize].first_child;

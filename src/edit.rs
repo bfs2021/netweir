@@ -124,6 +124,24 @@ impl Document {
         Ok(())
     }
 
+    /// Moves every template's contents in under the template element
+    /// itself, as lxml and Beautiful Soup show them and scrapers expect:
+    /// selectors and walks then see them. The contents are left empty.
+    pub fn adopt_template_contents(&mut self) {
+        for id in 0..self.nodes.len() as NodeId {
+            let Data::Element(e) = self.nodes[id as usize].data else {
+                continue;
+            };
+            if e.ns != Ns::Html || e.tag != Tag::Template || e.contents == NONE {
+                continue;
+            }
+            while let Some(child) = self.first_child(e.contents) {
+                self.detach(child);
+                self.insert(id, child, NONE);
+            }
+        }
+    }
+
     /// Takes `id` out of the tree. It stays usable, and can be inserted
     /// again.
     pub fn remove(&mut self, id: NodeId) {
@@ -223,6 +241,18 @@ mod tests {
         assert_eq!(doc.inner_html(0), "<p>a</p>");
         doc.append(0, second).unwrap();
         assert_eq!(doc.inner_html(0), "<p>a</p><p>b<em>x &amp; y</em></p>");
+    }
+
+    #[test]
+    fn template_contents_can_become_children() {
+        let mut doc = parse_fragment("<template><b>x</b></template>", Ns::Html, "div", false);
+        let t = doc.first_child(0).unwrap();
+        assert_eq!(doc.first_child(t), None);
+        doc.adopt_template_contents();
+        let b = doc.first_child(t).unwrap();
+        assert_eq!(doc.outer_html(b), "<b>x</b>");
+        // Written the same before and after.
+        assert_eq!(doc.inner_html(0), "<template><b>x</b></template>");
     }
 
     #[test]

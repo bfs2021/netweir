@@ -1,6 +1,7 @@
 //! An HTML parser that follows the WHATWG HTML Standard, written for
 //! Netweir and for speed.
 
+pub mod css;
 mod dom;
 mod edit;
 mod entities;
