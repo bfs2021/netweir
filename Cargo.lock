@@ -1270,6 +1270,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "netweir-html"
+version = "0.4.0"
+dependencies = [
+ "memchr",
+ "serde_json",
+]
+
+[[package]]
 name = "netweir-py"
 version = "0.4.0"
 dependencies = [
