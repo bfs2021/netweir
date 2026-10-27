@@ -1,7 +1,7 @@
 //! The HTML fragment serialization algorithm, section 13.3 of the HTML
 //! Standard: `innerHTML` and `outerHTML`.
 
-use crate::dom::{AttrNs, Data, Document, Kind, NodeId, Ns};
+use crate::dom::{Data, Document, Kind, NodeId, Ns};
 use crate::tags::Tag;
 
 /// Elements with no end tag and no contents when serialized.
@@ -69,18 +69,11 @@ impl Document {
                 let name = self.element_name(e);
                 out.push('<');
                 out.push_str(name);
-                for (ns, local, value) in self.attrs(id) {
+                // Names as written are the spec's serialized names:
+                // `xlink:href`, `xml:lang`, `xmlns`.
+                for (_, name, value) in self.attrs_written(id) {
                     out.push(' ');
-                    match ns {
-                        AttrNs::None => {}
-                        AttrNs::Xml => out.push_str("xml:"),
-                        AttrNs::Xmlns if local == "xmlns" => {}
-                        AttrNs::Xmlns => out.push_str("xmlns:"),
-                        AttrNs::XLink => out.push_str("xlink:"),
-                        // An XML attribute's name is already qualified.
-                        AttrNs::Host(_) => {}
-                    }
-                    out.push_str(local);
+                    out.push_str(name);
                     out.push_str("=\"");
                     escape(value, true, out);
                     out.push('"');
@@ -126,6 +119,28 @@ impl Document {
             }
             Data::Document | Data::Fragment => self.children_html(id, out),
         }
+    }
+
+    /// The node alone: an element's start tag, escaped text, a comment
+    /// or a doctype; as `outer_html` writes it, without the children.
+    pub fn html_alone(&self, id: NodeId) -> String {
+        let mut out = String::new();
+        match &self.nodes[id as usize].data {
+            Data::Element(e) => {
+                out.push('<');
+                out.push_str(self.element_name(e));
+                for (_, name, value) in self.attrs_written(id) {
+                    out.push(' ');
+                    out.push_str(name);
+                    out.push_str("=\"");
+                    escape(value, true, &mut out);
+                    out.push('"');
+                }
+                out.push('>');
+            }
+            _ => self.node_html(id, &mut out),
+        }
+        out
     }
 
     fn raw_text_parent(&self, id: NodeId) -> bool {

@@ -946,8 +946,10 @@ impl TreeBuilder {
         for (n, v) in s.attrs() {
             let (attr_ns, local) = if ns == Ns::Html {
                 (AttrNs::None, n)
-            } else if let Some((attr_ns, local)) = foreign_attr(n) {
-                (attr_ns, local)
+            } else if let Some((attr_ns, _)) = foreign_attr(n) {
+                // Kept as written (`xlink:href`); attrs() gives the local
+                // name, attrs_written() this.
+                (attr_ns, n)
             } else if ns == Ns::Svg {
                 (AttrNs::None, svg_attr_name(n).unwrap_or(n))
             } else if n == "definitionurl" {

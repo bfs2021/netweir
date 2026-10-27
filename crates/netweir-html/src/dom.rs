@@ -415,11 +415,44 @@ impl Document {
     /// An element's attributes, in source order, as (namespace, local name,
     /// value).
     pub fn attrs(&self, id: NodeId) -> impl Iterator<Item = (AttrNs, &str, &str)> + '_ {
+        self.attrs_written(id).map(|(ns, name, value)| match ns {
+            AttrNs::XLink | AttrNs::Xml | AttrNs::Xmlns => (
+                ns,
+                name.split_once(':').map_or(name, |(_, local)| local),
+                value,
+            ),
+            _ => (ns, name, value),
+        })
+    }
+
+    /// An element's attributes with their names as written: `xlink:href`
+    /// rather than `href`, and an XML attribute's prefix kept.
+    pub fn attrs_written(&self, id: NodeId) -> impl Iterator<Item = (AttrNs, &str, &str)> + '_ {
         let range = self
             .element(id)
             .map_or(0..0, |e| e.attrs.start as usize..e.attrs.end as usize);
         self.attrs[range]
             .iter()
             .map(|a| (a.ns, self.str(a.name), self.str(a.value)))
+    }
+
+    /// An element's name lowercased, without allocating: SVG's
+    /// `foreignObject` gives `foreignobject`. An XML element's name as
+    /// written.
+    pub fn lower_name(&self, id: NodeId) -> Option<&str> {
+        let e = self.element(id)?;
+        Some(match e.name {
+            Name::Tag => e.tag.name(),
+            Name::Svg(i) => crate::tree::SVG_TAG_NAMES[i as usize].0,
+            Name::Span(s) => self.str(s),
+        })
+    }
+
+    /// The parser's number for an HTML element's tag, the same for every
+    /// element of that name: what [`crate::tag_number`] gives for it.
+    pub fn known_tag(&self, id: NodeId) -> Option<u8> {
+        self.element(id)
+            .filter(|e| e.tag != Tag::Other && e.ns != Ns::Xml)
+            .map(|e| e.tag as u8)
     }
 }

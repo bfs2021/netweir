@@ -969,8 +969,15 @@ impl Cx<'_> {
         // The raw attributes, so a value is only looked at once the name
         // matches.
         doc.attrs[range].iter().any(|attr| {
+            let name = doc.str(attr.name);
+            // A namespaced attribute is stored as written (`xlink:href`);
+            // `[*|href]` names its local part.
+            let name = match attr.ns {
+                AttrNs::None => name,
+                _ => name.split_once(':').map_or(name, |(_, local)| local),
+            };
             (attr.ns == AttrNs::None || a.any_ns)
-                && doc.str(attr.name) == want.as_str()
+                && name == want.as_str()
                 && (a.op == AttrOp::Exists
                     || value_matches(a.op, doc.str(attr.value), &a.value, insensitive))
         })

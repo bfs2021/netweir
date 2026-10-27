@@ -24,6 +24,13 @@ pub fn named_reference(name: &str) -> Option<&'static str> {
         .map(|i| entities::ENTITIES[i].1)
 }
 
+/// The number [`Document::known_tag`] gives elements named `name`
+/// (lowercase), if the parser knows the tag.
+pub fn tag_number(name: &str) -> Option<u8> {
+    let tag = tags::Tag::from_name(name);
+    (tag != tags::Tag::Other).then_some(tag as u8)
+}
+
 /// Whether `name` (in any case) names an element of HTML, current or
 /// obsolete, or the root of SVG or MathML: `div`, `marquee`, `svg`; not
 /// `rss`.
