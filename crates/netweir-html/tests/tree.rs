@@ -115,6 +115,7 @@ fn serialize(doc: &Document, node: NodeId, depth: usize, out: &mut Vec<String>) 
                     Ns::Html => "",
                     Ns::Svg => "svg ",
                     Ns::MathMl => "math ",
+                    Ns::Xml => "xml ",
                 };
                 out.push(format!("| {pad}<{prefix}{name}>"));
                 let mut attrs: Vec<String> = doc
@@ -126,6 +127,7 @@ fn serialize(doc: &Document, node: NodeId, depth: usize, out: &mut Vec<String>) 
                             AttrNs::Xml => format!("xml {local}"),
                             AttrNs::Xmlns if local == "xmlns" => "xmlns".to_string(),
                             AttrNs::Xmlns => format!("xmlns {local}"),
+                            AttrNs::Host(_) => local.to_string(),
                         };
                         format!("{name}=\"{value}\"")
                     })
@@ -144,7 +146,7 @@ fn serialize(doc: &Document, node: NodeId, depth: usize, out: &mut Vec<String>) 
             Kind::ProcessingInstruction { target, data } => {
                 out.push(format!("| {pad}<?{target} {data}?>"))
             }
-            Kind::Document | Kind::Fragment => {}
+            Kind::Document | Kind::Fragment | Kind::Cdata(_) => {}
         }
         if !matches!(doc.kind(child), Kind::Element { .. })
             || doc.template_contents(child).is_none()

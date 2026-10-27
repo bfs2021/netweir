@@ -236,6 +236,8 @@ fn special(o: Open) -> bool {
         ),
         Ns::MathMl => matches!(o.tag, Mi | Mo | Mn | Ms | Mtext | AnnotationXml),
         Ns::Svg => matches!(o.tag, ForeignObject | Desc | Title),
+        // The HTML parser never makes XML elements.
+        Ns::Xml => false,
     }
 }
 
@@ -248,6 +250,8 @@ fn scope_boundary(o: Open, scope: Scope) -> bool {
         ),
         Ns::MathMl => matches!(o.tag, Mi | Mo | Mn | Ms | Mtext | AnnotationXml),
         Ns::Svg => matches!(o.tag, ForeignObject | Desc | Title),
+        // The HTML parser never makes XML elements.
+        Ns::Xml => false,
     };
     match scope {
         Scope::Default => base(),
@@ -1327,7 +1331,7 @@ impl TreeBuilder {
         let html_integration = match a.ns {
             Ns::Svg => matches!(a.tag, Tag::ForeignObject | Tag::Desc | Tag::Title),
             Ns::MathMl => self.doc.element(a.id).is_some_and(|e| e.html_integration),
-            Ns::Html => false,
+            Ns::Html | Ns::Xml => false,
         };
         match t {
             Tok::Start(s) => {
@@ -2731,7 +2735,7 @@ impl TreeBuilder {
             let html_integration = match c.ns {
                 Ns::Svg => matches!(c.tag, Tag::ForeignObject | Tag::Desc | Tag::Title),
                 Ns::MathMl => self.doc.element(c.id).is_some_and(|e| e.html_integration),
-                Ns::Html => true,
+                Ns::Html | Ns::Xml => true,
             };
             if mathml_text_integration(c) || html_integration {
                 break;

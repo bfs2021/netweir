@@ -917,6 +917,10 @@ impl Cx<'_> {
                     } else {
                         self.doc.element_name(e) == lower
                     }
+                } else if e.ns == Ns::Xml {
+                    // In XML a type selector names the local part, in any
+                    // case: `creator` finds `dc:creator` and `Creator`.
+                    xml_local(self.doc.element_name(e)).eq_ignore_ascii_case(lower)
                 } else {
                     self.doc.element_name(e) == exact
                 }
@@ -949,6 +953,9 @@ impl Cx<'_> {
 
     fn attr_matches(&self, el: NodeId, ns: Ns, a: &AttrSelector) -> bool {
         let doc = self.doc;
+        if ns == Ns::Xml {
+            return self.xml_attr_matches(el, a);
+        }
         let html = ns == Ns::Html;
         let insensitive = match a.case {
             Case::Insensitive => true,
@@ -966,6 +973,31 @@ impl Cx<'_> {
                 && doc.str(attr.name) == want.as_str()
                 && (a.op == AttrOp::Exists
                     || value_matches(a.op, doc.str(attr.value), &a.value, insensitive))
+        })
+    }
+
+    /// An attribute selector in XML: the attribute is found by its local
+    /// name in any case, one written exactly as asked winning over others
+    /// (`id` over `ID`), and only that one is compared.
+    fn xml_attr_matches(&self, el: NodeId, a: &AttrSelector) -> bool {
+        let doc = self.doc;
+        let range = doc
+            .element(el)
+            .map_or(0..0, |e| e.attrs.start as usize..e.attrs.end as usize);
+        let attrs = &doc.attrs[range];
+        let local = |attr: &crate::dom::Attr| xml_local(doc.str(attr.name));
+        let found = attrs
+            .iter()
+            .find(|attr| local(attr) == a.exact)
+            .or_else(|| {
+                attrs
+                    .iter()
+                    .find(|attr| local(attr).eq_ignore_ascii_case(&a.lower))
+            });
+        let insensitive = a.case == Case::Insensitive;
+        found.is_some_and(|attr| {
+            a.op == AttrOp::Exists
+                || value_matches(a.op, doc.str(attr.value), &a.value, insensitive)
         })
     }
 
@@ -1226,6 +1258,11 @@ fn same_type(doc: &Document, a: &crate::dom::Element, b: &crate::dom::Element) -
         } else {
             doc.element_name(a) == doc.element_name(b)
         }
+}
+
+/// An XML name without its prefix.
+fn xml_local(name: &str) -> &str {
+    name.split_once(':').map_or(name, |(_, local)| local)
 }
 
 fn nth_matches(a: i64, b: i64, index: i64) -> bool {

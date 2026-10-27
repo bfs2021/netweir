@@ -77,6 +77,8 @@ impl Document {
                         AttrNs::Xmlns if local == "xmlns" => {}
                         AttrNs::Xmlns => out.push_str("xmlns:"),
                         AttrNs::XLink => out.push_str("xlink:"),
+                        // An XML attribute's name is already qualified.
+                        AttrNs::Host(_) => {}
                     }
                     out.push_str(local);
                     out.push_str("=\"");
@@ -111,6 +113,11 @@ impl Document {
                 out.push(' ');
                 out.push_str(self.str(*data));
                 out.push_str("?>");
+            }
+            Data::Cdata(span) => {
+                out.push_str("<![CDATA[");
+                out.push_str(self.str(*span));
+                out.push_str("]]>");
             }
             Data::Doctype { name, .. } => {
                 out.push_str("<!DOCTYPE ");

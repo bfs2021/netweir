@@ -44,6 +44,8 @@ impl Document {
                 };
                 (tag, name)
             }
+            // An XML element is never an HTML one, whatever its name.
+            Ns::Xml => (Tag::Other, Name::Span(self.push_stable(name))),
             _ => {
                 let tag = Tag::from_name(&lower);
                 let name = if tag != Tag::Other && tag.name() == name {
@@ -73,6 +75,11 @@ impl Document {
     pub fn create_text(&mut self, text: &str) -> NodeId {
         let span = self.push_stable(text);
         self.add(Data::Text(span))
+    }
+
+    pub fn create_cdata(&mut self, text: &str) -> NodeId {
+        let span = self.push_stable(text);
+        self.add(Data::Cdata(span))
     }
 
     pub fn create_comment(&mut self, text: &str) -> NodeId {
@@ -173,6 +180,68 @@ impl Document {
             }
             true
         });
+    }
+
+    /// Adds an attribute as given, after the others, without replacing one
+    /// of the same name: for building XML, where the caller has already
+    /// checked names.
+    pub fn add_attr(&mut self, id: NodeId, ns: AttrNs, name: &str, value: &str) {
+        let name = self.push_stable(name);
+        let value = self.push_stable(value);
+        self.rewrite_attrs(id, |_, attrs| {
+            attrs.push(Attr { ns, name, value });
+            true
+        });
+    }
+
+    /// Renames the element: lowercased for HTML, as given for the rest.
+    pub fn rename(&mut self, id: NodeId, name: &str) {
+        let Some(e) = self.element(id).copied() else {
+            return;
+        };
+        let (tag, new) = match e.ns {
+            Ns::Xml => (Tag::Other, Name::Span(self.push_stable(name))),
+            Ns::Html => {
+                let lower = name.to_ascii_lowercase();
+                let tag = Tag::from_name(&lower);
+                let new = if tag == Tag::Other {
+                    Name::Span(self.push_stable(&lower))
+                } else {
+                    Name::Tag
+                };
+                (tag, new)
+            }
+            _ => (e.tag, Name::Span(self.push_stable(name))),
+        };
+        if let Data::Element(e) = &mut self.nodes[id as usize].data {
+            e.tag = tag;
+            e.name = new;
+        }
+    }
+
+    /// Renames the element's `index`th attribute, and sets its namespace.
+    pub fn rename_attr(&mut self, id: NodeId, index: usize, ns: AttrNs, name: &str) {
+        let name = self.push_stable(name);
+        self.rewrite_attrs(id, |_, attrs| match attrs.get_mut(index) {
+            Some(a) => {
+                a.ns = ns;
+                a.name = name;
+                true
+            }
+            None => false,
+        });
+    }
+
+    /// Removes the element's `index`th attribute; false if there's none.
+    pub fn remove_attr_at(&mut self, id: NodeId, index: usize) -> bool {
+        self.rewrite_attrs(id, |_, attrs| {
+            if index < attrs.len() {
+                attrs.remove(index);
+                true
+            } else {
+                false
+            }
+        })
     }
 
     /// Removes an attribute by name; false if there wasn't one.
@@ -280,6 +349,40 @@ mod tests {
         doc.set_attr(a, "title", "new");
         assert_eq!(doc.attrs(a).next().unwrap().2.as_ptr(), href);
         assert!(matches!(doc.kind(text), crate::Kind::Text(t) if t.as_ptr() == data));
+    }
+
+    #[test]
+    fn xml_is_built_as_written_and_matched_as_netweir_did() {
+        use crate::css::SelectorList;
+        use crate::{AttrNs, Document};
+        let mut doc = Document::empty();
+        let feed = doc.create_element(Ns::Xml, "Feed");
+        doc.append(0, feed).unwrap();
+        let entry = doc.create_element(Ns::Xml, "dc:Creator");
+        doc.add_attr(entry, AttrNs::None, "ID", "up");
+        doc.add_attr(entry, AttrNs::None, "id", "lo");
+        doc.add_attr(entry, AttrNs::Host(3), "x:href", "/p");
+        doc.append(feed, entry).unwrap();
+        let cdata = doc.create_cdata("<raw>");
+        doc.append(entry, cdata).unwrap();
+        let found = |css: &str| SelectorList::parse(css).unwrap().select(&doc, 0).len();
+        assert_eq!(found("feed creator"), 1);
+        assert_eq!(found("[id=lo]"), 1);
+        assert_eq!(found("[id=up]"), 0);
+        assert_eq!(found("#lo"), 1);
+        assert_eq!(found("#up"), 0);
+        assert_eq!(found("[href^='/']"), 1);
+        assert_eq!(
+            doc.outer_html(entry),
+            "<dc:Creator ID=\"up\" id=\"lo\" x:href=\"/p\"><![CDATA[<raw>]]></dc:Creator>"
+        );
+        doc.rename(entry, "Creator");
+        doc.rename_attr(entry, 2, AttrNs::None, "href");
+        assert!(doc.remove_attr_at(entry, 0));
+        assert_eq!(
+            doc.outer_html(entry),
+            "<Creator id=\"lo\" href=\"/p\"><![CDATA[<raw>]]></Creator>"
+        );
     }
 
     #[test]

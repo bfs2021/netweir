@@ -15,6 +15,9 @@ pub enum Ns {
     Html,
     Svg,
     MathMl,
+    /// An element of an XML document: its name is the qualified name as
+    /// written, and its namespace is the host's to keep.
+    Xml,
 }
 
 /// A namespaced attribute's namespace, from the spec's "adjust foreign
@@ -25,6 +28,9 @@ pub enum AttrNs {
     XLink,
     Xml,
     Xmlns,
+    /// An XML attribute in a namespace the host numbered; its name is the
+    /// qualified name as written.
+    Host(u32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +104,8 @@ pub(crate) enum Data {
         target: Span,
         data: Span,
     },
+    /// An XML CDATA section.
+    Cdata(Span),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -147,6 +155,7 @@ pub enum Kind<'a> {
         target: &'a str,
         data: &'a str,
     },
+    Cdata(&'a str),
 }
 
 impl Document {
@@ -169,6 +178,12 @@ impl Document {
             quirks: Quirks::No,
             scripting: false,
         }
+    }
+
+    /// An empty document to build into, as XML is: no source, no nodes
+    /// but the document itself.
+    pub fn empty() -> Document {
+        Document::new(Data::Document, 0)
     }
 
     pub fn root(&self) -> NodeId {
@@ -389,6 +404,7 @@ impl Document {
             },
             Data::Text(s) => Kind::Text(self.str(*s)),
             Data::Comment(s) => Kind::Comment(self.str(*s)),
+            Data::Cdata(s) => Kind::Cdata(self.str(*s)),
             Data::ProcessingInstruction { target, data } => Kind::ProcessingInstruction {
                 target: self.str(*target),
                 data: self.str(*data),
