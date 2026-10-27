@@ -506,6 +506,51 @@ def test_start_can_be_a_plain_generator(base):
     assert Plain().run()["items"] == 1
 
 
+def test_a_spider_with_only_start_requests_crawls_what_it_yields(base):
+    class Old(netweir.Spider):
+        settings = FAST
+
+        def start_requests(self):
+            yield netweir.Request(f"{base}/book/a")
+            yield netweir.Request(f"{base}/book/b")
+
+        def parse(self, page):
+            yield {"url": page.url}
+
+    assert Old().run()["items"] == 2
+
+
+def test_start_requests_can_return_a_list(base):
+    class Listed(netweir.Spider):
+        settings = FAST
+
+        def start_requests(self):
+            return [netweir.Request(f"{base}/book/a")]
+
+        def parse(self, page):
+            yield {"url": page.url}
+
+    assert Listed().run()["items"] == 1
+
+
+def test_start_requests_can_build_on_the_default_one(base):
+    urls = []
+
+    class Extended(netweir.Spider):
+        settings = FAST
+        start_urls = [f"{base}/book/a"]
+
+        def start_requests(self):
+            yield from super().start_requests()
+            yield netweir.Request(f"{base}/book/b")
+
+        def parse(self, page):
+            urls.append(page.url)
+
+    Extended().run()
+    assert sorted(urls) == [f"{base}/book/a", f"{base}/book/b"]
+
+
 def test_command_line_spiders_can_use_dataclasses(base, tmp_path):
     script = tmp_path / "netweir.py"  # a name that could shadow the package
     script.write_text(

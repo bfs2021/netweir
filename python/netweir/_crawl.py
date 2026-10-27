@@ -589,7 +589,16 @@ class Spider:
 
     async def start(self) -> AsyncIterator[Request]:
         """The first requests. An async generator by default; a plain
-        generator or a list works too."""
+        generator or a list works too. By default, what
+        ``start_requests()`` gives, as in Scrapy, so a spider written for
+        Scrapy before 2.13, with only ``start_requests()``, works as it is."""
+        for request in self.start_requests():
+            yield request
+
+    def start_requests(self) -> Iterable[Request]:
+        """Scrapy's older way to give the first requests, which the default
+        ``start()`` yields: a generator or a list. By default, a request
+        for each of ``start_urls``, then each of ``sitemap_urls``."""
         for url in self.start_urls:
             yield Request(url)
         for url in self.sitemap_urls:

@@ -1245,6 +1245,29 @@ def test_process_start_and_process_start_requests(base):
     assert sorted(items) == [base + "/extra", base + "/one"]
 
 
+def test_process_start_requests_sees_what_start_requests_yields(base):
+    seen = []
+
+    class Legacy:
+        def process_start_requests(self, start_requests, spider):
+            for request in start_requests:
+                seen.append(request.url)
+                yield request
+
+    class Old(netweir.Spider):
+        settings = FAST
+        spider_middlewares = [Legacy()]
+
+        def start_requests(self):
+            yield netweir.Request(base + "/one")
+
+        def parse(self, page):
+            yield {"url": page.url}
+
+    assert Old().run()["items"] == 1
+    assert seen == [base + "/one"]
+
+
 def test_spider_middlewares_with_workers(base):
     import os
 
