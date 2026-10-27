@@ -1,23 +1,28 @@
 use std::cell::{Cell, UnsafeCell};
-use std::ffi::{c_char, c_int, c_void};
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
-use crate::ffi::{self, RawDocument, RawNode, str_at};
+use netweir_html as html;
+
 use crate::index::Index;
 use crate::xml::{self, XmlNames};
 
 /// A parsed HTML document.
 ///
-/// Built by lexbor following the HTML5 spec, so a page parses the way a
+/// Built by Netweir's parser following the HTML Standard, so a page parses the way a
 /// browser would parse it: missing `<html>`, `<head>`, `<body>` and `<tbody>`
 /// elements are added, and misnested tags are repaired.
 pub struct Document {
-    pub(crate) raw: *mut RawDocument,
-    /// For an XML document, its namespaces (which lexbor can't keep).
+    /// The tree. Readers share it; an edit, which has the document to
+    /// itself (see `edit`), is the only thing that changes it.
+    tree: UnsafeCell<html::Document>,
+    /// For an XML document, its namespaces (the HTML tree has no place
+    /// for them).
     /// Only an edit changes them, as with the index.
     xml: UnsafeCell<Option<Box<XmlNames>>>,
     /// A flat, document-order index of every node, built on first use and
@@ -26,7 +31,7 @@ pub struct Document {
     /// Nodes an edit left without a parent: removed ones, and new ones not
     /// yet placed. The index covers their subtrees too, so a handle to one
     /// keeps working. Pruned whenever the index is built.
-    detached: Mutex<Vec<usize>>,
+    detached: Mutex<Vec<u32>>,
     /// Readers holding a [`Reading`] taken the slow way, or `WRITING`
     /// while an edit runs; `WAITING` while an edit waits for readers to
     /// finish.
@@ -82,11 +87,11 @@ struct Slot(AtomicU32);
 /// could wait for an edit that waits for a reader needing the GIL.
 const PATIENCE: u32 = 2000;
 
-// SAFETY: reading never changes the tree; selector matching keeps its
-// state in a matcher of its own per call (query.rs). Edits change it, and
-// their callers promise that other threads reading at the time hold a
-// `Reading`, which an edit waits for. No node is freed before the
-// document is, so a pointer into it never dangles.
+// SAFETY: reading never changes the tree. Edits change it, and their
+// callers promise that other threads reading at the time hold a
+// `Reading`, which an edit waits for. No string handed out ever moves:
+// the parser's are fixed once it's done, and an edit's get allocations of
+// their own (netweir-html's push_stable).
 unsafe impl Send for Document {}
 unsafe impl Sync for Document {}
 
@@ -200,18 +205,43 @@ impl Document {
 
     /// Like [`Document::parse`], but gives up once `budget` has passed.
     ///
-    /// The HTML5 spec makes some inputs, such as thousands of unclosed
-    /// `<div>`s, take time quadratic in their nesting depth. A 400 KB page of
-    /// them takes seconds. Browsers cap the depth; lexbor does not. A crawler
-    /// fetching pages it does not control should parse with a budget.
+    /// The HTML5 spec makes some inputs take time quadratic in their size.
+    /// A crawler fetching pages it does not control should parse with a
+    /// budget.
     pub fn parse_within(html: &str, budget: Duration) -> Result<Document, ParseTimeout> {
-        // Known limit: the budget is checked between 16 KB chunks, so a parse can
-        // overrun it by the time one chunk takes. It bounds time, not memory:
-        // a crafted page of distinct formatting tags makes the HTML5 adoption
-        // agency clone thousands of elements per paragraph (64 KB reached
-        // 6.7 GB in a test). A node cap checked between chunks comes with the
-        // crawler.
-        parse_in_chunks(html, budget, 16 * 1024)
+        let options = html::Options {
+            scripting: false,
+            budget: (budget != Duration::MAX).then_some(budget),
+        };
+        let mut tree = match html::parse_with(html, options) {
+            Ok(tree) => tree,
+            Err(html::ParseError::Timeout { parsed, .. }) => {
+                return Err(ParseTimeout { budget, parsed });
+            }
+            // ponytail: over 1 GB of HTML is reported as running out of
+            // time at the start; a ParseError enum when anyone parses that.
+            Err(html::ParseError::TooLarge { .. }) => {
+                return Err(ParseTimeout { budget, parsed: 0 });
+            }
+        };
+        // As lxml and Beautiful Soup show them: a template's contents are
+        // its children.
+        tree.adopt_template_contents();
+        Ok(Document::wrap(tree, None))
+    }
+
+    pub(crate) fn tree(&self) -> &html::Document {
+        // SAFETY: only an edit changes the tree, with no reader about.
+        unsafe { &*self.tree.get() }
+    }
+
+    /// The tree to change.
+    ///
+    /// # Safety
+    /// Only inside an edit, which has the document to itself.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn tree_mut(&self) -> &mut html::Document {
+        unsafe { &mut *self.tree.get() }
     }
 
     /// The document's index. Building it writes each node's `user` field
@@ -220,34 +250,30 @@ impl Document {
         // SAFETY: only an edit replaces the OnceLock, and an edit runs with
         // no reader on another thread and none of this crate's code holding
         // the reference on this one.
-        unsafe { &*self.index.get() }.get_or_init(|| Index::build(&self.roots()))
+        unsafe { &*self.index.get() }.get_or_init(|| Index::build(self.tree(), &self.roots()))
     }
 
     /// The document node, then every node that is the top of a subtree
     /// outside it.
-    fn roots(&self) -> Vec<*mut RawNode> {
-        let root = unsafe { ffi::nw_root(self.raw) };
+    fn roots(&self) -> Vec<u32> {
+        let tree = self.tree();
         let mut detached = self.detached.lock().unwrap_or_else(|e| e.into_inner());
         detached.sort_unstable();
         detached.dedup();
         // A node put back in a tree is indexed with it.
-        detached.retain(|&n| unsafe { ffi::nw_parent(n as *mut RawNode) }.is_null());
-        std::iter::once(root)
-            .chain(detached.iter().map(|&n| n as *mut RawNode))
+        detached.retain(|&n| tree.parent(n).is_none());
+        std::iter::once(tree.root())
+            .chain(detached.iter().copied())
             .collect()
     }
 
-    fn order_of(&self, raw: *mut RawNode) -> u32 {
-        self.index();
-        unsafe { ffi::nw_order(raw) as u32 }
+    fn order_of(&self, id: u32) -> u32 {
+        self.index().order(id)
     }
 
     /// The document node. Its children are the doctype and `<html>`.
     pub fn root(&self) -> Node<'_> {
-        Node {
-            doc: self,
-            raw: unsafe { ffi::nw_root(self.raw) },
-        }
+        Node { doc: self, id: 0 }
     }
 
     /// Holds off edits until the returned value is dropped. A thread that
@@ -477,11 +503,11 @@ impl Document {
         self.woken.notify_all();
     }
 
-    fn mark_detached(&self, n: *mut RawNode) {
+    fn mark_detached(&self, n: u32) {
         self.detached
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(n as usize);
+            .push(n);
     }
 
     /// Takes `node` (and everything in it) out of its tree. A handle to
@@ -494,13 +520,14 @@ impl Document {
     /// other thread reading the document meanwhile must hold a
     /// [`Document::read`]. Edits wait for those to be dropped.
     pub unsafe fn remove(&self, node: NodeId) -> Result<(), EditError> {
-        let n = node.raw();
+        let n = node.get();
         self.edit(|| {
-            if n == unsafe { ffi::nw_root(self.raw) } {
+            if n == 0 {
                 return invalid("the document itself can't be removed");
             }
-            if !unsafe { ffi::nw_parent(n) }.is_null() {
-                unsafe { ffi::nw_remove(n) };
+            let tree = unsafe { self.tree_mut() };
+            if tree.parent(n).is_some() {
+                tree.remove(n);
                 self.mark_detached(n);
             }
             Ok(())
@@ -521,14 +548,10 @@ impl Document {
         at: Option<isize>,
         items: &[C],
     ) -> Result<(), EditError> {
-        let p = parent.raw();
+        let p = parent.get();
         self.edit(|| {
             let before = at.and_then(|at| {
-                let children: Vec<*mut RawNode> = std::iter::successors(
-                    Some(unsafe { ffi::nw_first_child(p) }).filter(|c| !c.is_null()),
-                    |&c| Some(unsafe { ffi::nw_next(c) }).filter(|c| !c.is_null()),
-                )
-                .collect();
+                let children: Vec<u32> = self.tree().children(p).collect();
                 let i = if at < 0 {
                     at + children.len() as isize
                 } else {
@@ -549,17 +572,16 @@ impl Document {
         node: NodeId,
         with: &[C],
     ) -> Result<(), EditError> {
-        let n = node.raw();
+        let n = node.get();
         self.edit(|| {
-            let parent = unsafe { ffi::nw_parent(n) };
-            if parent.is_null() {
+            let Some(parent) = self.tree().parent(n) else {
                 return invalid("a node with no parent can't be replaced");
-            }
+            };
             if with.iter().any(|&c| c.into() == Content::Node(node)) {
                 return invalid("a node can't be replaced with itself");
             }
             unsafe { self.link(parent, Some(n), with)? };
-            unsafe { ffi::nw_remove(n) };
+            unsafe { self.tree_mut() }.remove(n);
             self.mark_detached(n);
             Ok(())
         })
@@ -570,22 +592,17 @@ impl Document {
     /// # Safety
     /// As for [`Document::remove`].
     pub unsafe fn unwrap(&self, node: NodeId) -> Result<(), EditError> {
-        let n = node.raw();
+        let n = node.get();
         self.edit(|| {
-            let parent = unsafe { ffi::nw_parent(n) };
-            if parent.is_null() {
+            let tree = unsafe { self.tree_mut() };
+            let Some(parent) = tree.parent(n) else {
                 return invalid("a node with no parent can't be unwrapped");
+            };
+            while let Some(child) = tree.first_child(n) {
+                tree.insert_before(parent, child, Some(n))
+                    .expect("a child moves to beside its parent");
             }
-            let mut child = unsafe { ffi::nw_first_child(n) };
-            while !child.is_null() {
-                let next = unsafe { ffi::nw_next(child) };
-                unsafe {
-                    ffi::nw_remove(child);
-                    ffi::nw_insert_before(n, child);
-                }
-                child = next;
-            }
-            unsafe { ffi::nw_remove(n) };
+            tree.remove(n);
             self.mark_detached(n);
             Ok(())
         })
@@ -596,25 +613,22 @@ impl Document {
     /// # Safety
     /// As for [`Document::remove`].
     pub unsafe fn set_text(&self, node: NodeId, text: &str) -> Result<(), EditError> {
-        let n = node.raw();
+        let n = node.get();
         self.edit(|| {
-            if unsafe { ffi::nw_type(n) } != ffi::ELEMENT {
+            if Node::from_raw(self, n).kind() != NodeKind::Element {
                 return invalid("only an element's text can be set");
             }
             let tag = Node::from_raw(self, n).tag().unwrap_or_default();
             if VOID.contains(&tag) {
                 return invalid(format!("<{tag}> can't hold text"));
             }
-            let t = self.new_text(text);
-            loop {
-                let child = unsafe { ffi::nw_first_child(n) };
-                if child.is_null() {
-                    break;
-                }
-                unsafe { ffi::nw_remove(child) };
+            let tree = unsafe { self.tree_mut() };
+            let t = tree.create_text(text);
+            while let Some(child) = tree.first_child(n) {
+                tree.remove(child);
                 self.mark_detached(child);
             }
-            unsafe { ffi::nw_append(n, t) };
+            tree.append(n, t).expect("an element takes text");
             Ok(())
         })
     }
@@ -622,9 +636,6 @@ impl Document {
     /// A new element, not yet in the tree: place it with
     /// [`Document::insert`]. In HTML names are lowercased; in XML they're
     /// kept as given, and the element has no namespace.
-    // Known limit: attributes are only ever set here, on an element nothing
-    // has borrowed from yet. Changing one on an existing element would
-    // rewrite memory a `&str` from `attr()` may still point at.
     ///
     /// # Safety
     /// As for [`Document::remove`].
@@ -653,22 +664,11 @@ impl Document {
         if self.is_xml() {
             return self.create_xml_element(tag, attrs);
         }
-        let tag = tag.to_ascii_lowercase();
         self.edit(|| {
-            let n = unsafe { ffi::nw_create_element(self.raw, tag.as_ptr().cast(), tag.len()) };
-            assert!(!n.is_null(), "lexbor failed to allocate an element");
+            let tree = unsafe { self.tree_mut() };
+            let n = tree.create_element(html::Ns::Html, tag);
             for (name, value) in attrs {
-                let name = name.to_ascii_lowercase();
-                let status = unsafe {
-                    ffi::nw_set_attr(
-                        n,
-                        name.as_ptr().cast(),
-                        name.len(),
-                        value.as_ptr().cast(),
-                        value.len(),
-                    )
-                };
-                assert_eq!(status, 0, "lexbor failed to allocate an attribute");
+                tree.set_attr(n, name, value);
             }
             self.mark_detached(n);
             Ok(NodeId(n as usize))
@@ -694,19 +694,10 @@ impl Document {
             }
         }
         self.edit(|| {
-            let n = unsafe { ffi::nw_xml_element(self.raw, tag.as_ptr().cast(), tag.len(), 0) };
-            assert!(!n.is_null(), "lexbor failed to allocate an element");
+            let tree = unsafe { self.tree_mut() };
+            let n = tree.create_element(html::Ns::Xml, tag);
             for (name, value) in attrs {
-                let a = unsafe {
-                    ffi::nw_xml_attr(
-                        n,
-                        name.as_ptr().cast(),
-                        name.len(),
-                        value.as_ptr().cast(),
-                        value.len(),
-                    )
-                };
-                assert!(!a.is_null(), "lexbor failed to allocate an attribute");
+                tree.add_attr(n, html::AttrNs::None, name, value);
             }
             self.mark_detached(n);
             Ok(NodeId(n as usize))
@@ -719,17 +710,10 @@ impl Document {
     /// As for [`Document::remove`].
     pub unsafe fn create_text(&self, text: &str) -> Result<NodeId, EditError> {
         self.edit(|| {
-            let n = self.new_text(text);
+            let n = unsafe { self.tree_mut() }.create_text(text);
             self.mark_detached(n);
             Ok(NodeId(n as usize))
         })
-    }
-
-    /// A text node with no parent. Only an edit may call it.
-    fn new_text(&self, text: &str) -> *mut RawNode {
-        let n = unsafe { ffi::nw_create_text(self.raw, text.as_ptr().cast(), text.len()) };
-        assert!(!n.is_null(), "lexbor failed to allocate a text node");
-        n
     }
 
     /// Puts `items` into `parent` before its child `before` (or at the
@@ -737,61 +721,54 @@ impl Document {
     /// makes the text last, so a failure changes nothing.
     unsafe fn link<'s, C: Copy + Into<Content<'s>>>(
         &self,
-        parent: *mut RawNode,
-        before: Option<*mut RawNode>,
+        parent: u32,
+        before: Option<u32>,
         items: &[C],
     ) -> Result<(), EditError> {
-        if !matches!(
-            unsafe { ffi::nw_type(parent) },
-            ffi::ELEMENT | ffi::DOCUMENT
-        ) {
+        let kind = |n: u32| Node::from_raw(self, n).kind();
+        if !matches!(kind(parent), NodeKind::Element | NodeKind::Document) {
             return invalid("only an element or the document can have children");
         }
-        if before.is_some_and(|b| unsafe { ffi::nw_parent(b) } != parent) {
+        let tree = self.tree();
+        if before.is_some_and(|b| tree.parent(b) != Some(parent)) {
             return invalid("the node to insert before isn't a child of the parent");
         }
         let given = || {
             items.iter().filter_map(|&c| match c.into() {
-                Content::Node(id) => Some(id.raw()),
+                Content::Node(id) => Some(id.get()),
                 Content::Text(_) => None,
             })
         };
         for n in given() {
             if !matches!(
-                unsafe { ffi::nw_type(n) },
-                ffi::ELEMENT | ffi::TEXT | ffi::CDATA | ffi::COMMENT
+                kind(n),
+                NodeKind::Element | NodeKind::Text | NodeKind::Comment
             ) {
                 return invalid("only elements, text and comments can be inserted");
             }
             // A node can't go inside itself.
-            let mut up = parent;
-            while !up.is_null() {
-                if up == n {
+            let mut up = Some(parent);
+            while let Some(u) = up {
+                if u == n {
                     return invalid("a node can't be put inside itself");
                 }
-                up = unsafe { ffi::nw_parent(up) };
+                up = tree.parent(u);
             }
         }
         // Inserting before a node that is itself being moved means before
         // the first one after it that isn't.
         let mut before = before;
         while let Some(b) = before.filter(|b| given().any(|n| n == *b)) {
-            before = Some(unsafe { ffi::nw_next(b) }).filter(|n| !n.is_null());
+            before = tree.next_sibling(b);
         }
+        let tree = unsafe { self.tree_mut() };
         for &item in items {
             let n = match item.into() {
-                Content::Node(id) => id.raw(),
-                Content::Text(text) => self.new_text(text),
+                Content::Node(id) => id.get(),
+                Content::Text(text) => tree.create_text(text),
             };
-            unsafe {
-                if !ffi::nw_parent(n).is_null() {
-                    ffi::nw_remove(n);
-                }
-                match before {
-                    Some(b) => ffi::nw_insert_before(b, n),
-                    None => ffi::nw_append(parent, n),
-                }
-            }
+            tree.insert_before(parent, n, before)
+                .expect("checked above");
         }
         Ok(())
     }
@@ -803,19 +780,15 @@ impl Document {
     pub unsafe fn node(&self, id: NodeId) -> Node<'_> {
         Node {
             doc: self,
-            raw: id.0 as *mut RawNode,
+            id: id.get(),
         }
     }
 }
 
 impl Document {
-    /// Takes ownership of a document lexbor made.
-    fn wrap(raw: *mut RawDocument, xml: Option<Box<XmlNames>>) -> Document {
-        // lexbor only fails when it cannot allocate. Rust aborts on allocation
-        // failure, so netweir treats lexbor's the same way.
-        assert!(!raw.is_null(), "lexbor failed to allocate a document");
+    fn wrap(tree: html::Document, xml: Option<Box<XmlNames>>) -> Document {
         Document {
-            raw,
+            tree: UnsafeCell::new(tree),
             xml: UnsafeCell::new(xml),
             index: UnsafeCell::new(OnceLock::new()),
             detached: Mutex::new(Vec::new()),
@@ -836,7 +809,12 @@ impl Document {
 
     /// An empty XML document, for the XML parser to fill.
     pub(crate) fn new_xml() -> Document {
-        Document::wrap(unsafe { ffi::nw_xml_document() }, Some(Box::default()))
+        Document::wrap(html::Document::empty(), Some(Box::default()))
+    }
+
+    /// The tree, to build an XML document into before anyone reads it.
+    pub(crate) fn tree_to_build(&mut self) -> &mut html::Document {
+        self.tree.get_mut()
     }
 
     /// Whether this is an XML document (see [`Document::parse_xml`]) rather
@@ -874,12 +852,15 @@ impl Document {
             for root in self.roots() {
                 let top = Node {
                     doc: self,
-                    raw: root,
+                    id: root,
                 };
-                for n in std::iter::once(top).chain(top.descendants()) {
-                    if n.kind() == NodeKind::Element {
-                        unsafe { strip_prefixes(n) };
-                    }
+                let elements: Vec<u32> = std::iter::once(top)
+                    .chain(top.descendants())
+                    .filter(|n| n.kind() == NodeKind::Element)
+                    .map(|n| n.id)
+                    .collect();
+                for n in elements {
+                    unsafe { strip_prefixes(self, n) };
                 }
             }
             // SAFETY: this edit has the document to itself.
@@ -893,94 +874,49 @@ impl Document {
 
 /// Renames an element and its attributes without their prefixes. Only an
 /// edit may call it.
-unsafe fn strip_prefixes(n: Node<'_>) {
-    let qname = n.qualified_name();
+unsafe fn strip_prefixes(doc: &Document, n: u32) {
+    let tree = unsafe { doc.tree_mut() };
+    let qname = tree.lower_name(n).unwrap_or("").to_string();
     if let Some((_, local)) = qname.split_once(':') {
-        let status = unsafe { ffi::nw_xml_rename(n.raw, local.as_ptr().cast(), local.len()) };
-        assert_eq!(status, 0, "lexbor failed to allocate a name");
+        tree.rename(n, local);
     }
-    let mut attrs = Vec::new();
-    let mut a = unsafe { ffi::nw_first_attr(n.raw) };
-    while !a.is_null() {
-        let mut len = 0;
-        let name = unsafe { str_at(ffi::nw_attr_qname(a, &mut len), len) };
-        attrs.push((a, name));
-        a = unsafe { ffi::nw_next_attr(a) };
-    }
+    let attrs: Vec<(String, String)> = tree
+        .attrs_written(n)
+        .map(|(_, name, value)| (name.to_string(), value.to_string()))
+        .collect();
     // Each name's attribute once the prefixes are gone: the plain ones
     // first, then the prefixed in order, each taking the place of any
     // attribute already of that name.
-    let mut by_name: std::collections::HashMap<&str, *mut ffi::RawAttr> = attrs
+    let local = |name: &str| name.split_once(':').map_or(name, |(_, l)| l).to_string();
+    let mut by_name: std::collections::HashMap<String, usize> = attrs
         .iter()
-        .filter(|(_, name)| !name.contains(':'))
-        .map(|&(a, name)| (name, a))
+        .enumerate()
+        .filter(|(_, (name, _))| !name.contains(':'))
+        .map(|(i, (name, _))| (name.clone(), i))
         .collect();
-    for &(a, name) in &attrs {
-        let Some((_, local)) = name.split_once(':') else {
-            continue;
-        };
-        if let Some(old) = by_name.insert(local, a) {
-            unsafe { ffi::nw_attr_remove(n.raw, old) };
+    let mut gone = vec![false; attrs.len()];
+    for (i, (name, _)) in attrs.iter().enumerate() {
+        if name.contains(':')
+            && let Some(old) = by_name.insert(local(name), i)
+        {
+            gone[old] = true;
         }
-        let status = unsafe { ffi::nw_xml_attr_rename(a, local.as_ptr().cast(), local.len()) };
-        assert_eq!(status, 0, "lexbor failed to allocate a name");
     }
-}
-
-impl Drop for Document {
-    fn drop(&mut self) {
-        unsafe { ffi::nw_destroy(self.raw) }
-    }
+    let names: Vec<String> = attrs.iter().map(|(name, _)| local(name)).collect();
+    let kept: Vec<(html::AttrNs, &str, &str)> = attrs
+        .iter()
+        .zip(&names)
+        .zip(&gone)
+        .filter(|(_, gone)| !**gone)
+        .map(|(((_, value), name), _)| (html::AttrNs::None, name.as_str(), value.as_str()))
+        .collect();
+    tree.set_attrs(n, &kept);
 }
 
 impl fmt::Debug for Document {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Document")
     }
-}
-
-fn parse_in_chunks(html: &str, budget: Duration, chunk: usize) -> Result<Document, ParseTimeout> {
-    let start = Instant::now();
-    let raw = unsafe { ffi::nw_chunk_begin() };
-    let doc = Document::wrap(raw, None);
-    let mut rest = html;
-    while !rest.is_empty() {
-        if start.elapsed() > budget {
-            return Err(ParseTimeout {
-                budget,
-                parsed: html.len() - rest.len(),
-            });
-        }
-        let mut cut = rest.len().min(chunk);
-        while !rest.is_char_boundary(cut) {
-            cut += 1;
-        }
-        let (head, tail) = rest.split_at(cut);
-        let status = unsafe { ffi::nw_chunk(doc.raw, head.as_ptr().cast(), head.len()) };
-        assert_eq!(status, 0, "lexbor failed to allocate while parsing");
-        rest = tail;
-    }
-    assert_eq!(
-        unsafe { ffi::nw_chunk_end(doc.raw, has_template(html) as c_int) },
-        0,
-        "lexbor failed to allocate while parsing"
-    );
-    Ok(doc)
-}
-
-/// Whether `html` has a `<template` tag, in any case: the only way a
-/// template gets into a parsed document.
-fn has_template(html: &str) -> bool {
-    // Faster than checking every `<`, of which a page has hundreds of
-    // thousands; `<te` in each case is rare.
-    let bytes = html.as_bytes();
-    [b"<te", b"<tE", b"<Te", b"<TE"].iter().any(|start| {
-        memchr::memmem::find_iter(bytes, start).any(|i| {
-            bytes
-                .get(i + 1..i + 9)
-                .is_some_and(|name| name.eq_ignore_ascii_case(b"template"))
-        })
-    })
 }
 
 /// Returned by [`Document::parse_within`] when parsing ran out of time.
@@ -1009,8 +945,8 @@ impl std::error::Error for ParseTimeout {}
 pub struct NodeId(usize);
 
 impl NodeId {
-    fn raw(self) -> *mut RawNode {
-        self.0 as *mut RawNode
+    fn get(self) -> u32 {
+        self.0 as u32
     }
 }
 
@@ -1030,66 +966,59 @@ pub enum NodeKind {
 #[derive(Clone, Copy)]
 pub struct Node<'a> {
     pub(crate) doc: &'a Document,
-    pub(crate) raw: *mut RawNode,
+    pub(crate) id: u32,
 }
 
 impl<'a> Node<'a> {
-    pub(crate) fn from_raw(doc: &'a Document, raw: *mut RawNode) -> Node<'a> {
-        Node { doc, raw }
+    pub(crate) fn from_raw(doc: &'a Document, id: u32) -> Node<'a> {
+        Node { doc, id }
     }
 
-    pub(crate) fn wrap(doc: &'a Document, raw: *mut RawNode) -> Option<Node<'a>> {
-        (!raw.is_null()).then_some(Node { doc, raw })
+    fn tree(&self) -> &'a html::Document {
+        self.doc.tree()
+    }
+
+    fn wrap(&self, id: Option<u32>) -> Option<Node<'a>> {
+        id.map(|id| Node { doc: self.doc, id })
     }
 
     pub fn id(&self) -> NodeId {
-        NodeId(self.raw as usize)
+        NodeId(self.id as usize)
     }
 
     pub fn kind(&self) -> NodeKind {
-        match unsafe { ffi::nw_type(self.raw) } {
-            ffi::ELEMENT => NodeKind::Element,
-            ffi::TEXT | ffi::CDATA => NodeKind::Text,
-            ffi::COMMENT => NodeKind::Comment,
-            ffi::PI => NodeKind::ProcessingInstruction,
-            ffi::DOCUMENT => NodeKind::Document,
-            ffi::DOCTYPE => NodeKind::Doctype,
-            _ => NodeKind::Other,
+        match self.tree().kind(self.id) {
+            html::Kind::Element { .. } => NodeKind::Element,
+            html::Kind::Text(_) | html::Kind::Cdata(_) => NodeKind::Text,
+            html::Kind::Comment(_) => NodeKind::Comment,
+            html::Kind::ProcessingInstruction { .. } => NodeKind::ProcessingInstruction,
+            html::Kind::Document => NodeKind::Document,
+            html::Kind::Doctype { .. } => NodeKind::Doctype,
+            html::Kind::Fragment => NodeKind::Other,
         }
     }
 
     /// The tag name, for elements: lowercase in HTML, and in XML as
     /// written, without its prefix.
     pub fn tag(&self) -> Option<&'a str> {
-        if self.kind() != NodeKind::Element {
-            return None;
-        }
+        let name = self.tree().lower_name(self.id)?;
         if self.doc.is_xml() {
-            let q = self.qualified_name();
-            return Some(q.split_once(':').map_or(q, |(_, local)| local));
+            return Some(name.split_once(':').map_or(name, |(_, local)| local));
         }
-        let mut len = 0;
-        Some(unsafe { str_at(ffi::nw_tag(self.raw, &mut len), len) })
+        Some(name)
     }
 
     /// An element's name with its prefix, as written (`atom:entry`); the
     /// same as [`Node::tag`] in HTML.
     pub fn qualified_name(&self) -> &'a str {
-        if self.kind() != NodeKind::Element {
-            return "";
-        }
-        if !self.doc.is_xml() {
-            return self.tag().unwrap_or("");
-        }
-        let mut len = 0;
-        unsafe { str_at(ffi::nw_qname(self.raw, &mut len), len) }
+        self.tree().lower_name(self.id).unwrap_or("")
     }
 
     /// The namespace URI of an element in an XML document; None outside
     /// any namespace, and always for HTML.
     pub fn namespace(&self) -> Option<&'a str> {
         let names = self.doc.xml_names()?;
-        match names.ns_of(self.raw as usize) {
+        match names.ns_of(self.id as usize) {
             0 => None,
             id => Some(names.uri(id)),
         }
@@ -1100,120 +1029,92 @@ impl<'a> Node<'a> {
     pub(crate) fn ns_id(&self) -> u32 {
         self.doc
             .xml_names()
-            .map_or(0, |names| names.ns_of(self.raw as usize))
+            .map_or(0, |names| names.ns_of(self.id as usize))
     }
 
     /// The target of a processing instruction (`xml-stylesheet`).
     pub fn pi_target(&self) -> Option<&'a str> {
-        if self.kind() != NodeKind::ProcessingInstruction {
-            return None;
+        match self.tree().kind(self.id) {
+            html::Kind::ProcessingInstruction { target, .. } => Some(target),
+            _ => None,
         }
-        let mut len = 0;
-        Some(unsafe { str_at(ffi::nw_pi_target(self.raw, &mut len), len) })
     }
 
-    /// An element's attributes with what XPath needs of them: the name as
-    /// written, its namespace id (0 for none, and in HTML) and the value.
+    /// An element's attributes with what XPath needs of them: the name
+    /// (as written in XML, as [`Node::attrs`] gives it in HTML), its
+    /// namespace id (0 for none, and in HTML) and the value.
     pub(crate) fn xml_attrs(&self) -> Vec<(&'a str, u32, &'a str)> {
-        let mut out = Vec::new();
-        if self.kind() != NodeKind::Element {
-            return out;
-        }
-        let names = self.doc.xml_names();
-        let mut a = unsafe { ffi::nw_first_attr(self.raw) };
-        while !a.is_null() {
-            let (mut nl, mut vl) = (0, 0);
-            let name = match names {
-                Some(_) => unsafe { str_at(ffi::nw_attr_qname(a, &mut nl), nl) },
-                None => unsafe { str_at(ffi::nw_attr_name(a, &mut nl), nl) },
-            };
-            let value = unsafe { str_at(ffi::nw_attr_value(a, &mut vl), vl) };
-            let ns = names.map_or(0, |n| n.ns_of(a as usize));
-            out.push((name, ns, value));
-            a = unsafe { ffi::nw_next_attr(a) };
-        }
-        out
+        self.tree()
+            .attrs(self.id)
+            .map(|(ns, name, value)| {
+                let ns = match ns {
+                    html::AttrNs::Host(id) => id,
+                    _ => 0,
+                };
+                (name, ns, value)
+            })
+            .collect()
     }
 
     pub fn attr(&self, name: &str) -> Option<&'a str> {
-        if self.kind() != NodeKind::Element {
-            return None;
-        }
+        let mut attrs = self.tree().attrs(self.id);
         if self.doc.is_xml() {
-            // lexbor's lookup would also take `x:name` for `name`.
-            return self
-                .attrs()
-                .into_iter()
-                .find(|(n, _)| *n == name)
-                .map(|(_, v)| v);
+            return attrs.find(|(_, n, _)| *n == name).map(|(_, _, v)| v);
         }
-        let mut len = 0;
-        let ptr = unsafe { ffi::nw_get_attr(self.raw, name.as_ptr().cast(), name.len(), &mut len) };
-        (!ptr.is_null()).then(|| unsafe { str_at(ptr, len) })
+        // HTML names are lowercase; the one asked for may not be.
+        attrs
+            .find(|(_, n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, _, v)| v)
     }
 
     /// Every attribute as `(name, value)`, in source order. In XML a name
-    /// keeps its prefix as written (`xml:lang`).
+    /// keeps its prefix as written (`xml:lang`). In HTML, lowercase as
+    /// tokenized (SVG's `viewbox`, as lxml has it), and a namespaced one
+    /// by its local name (`href` for `xlink:href`).
     pub fn attrs(&self) -> Vec<(&'a str, &'a str)> {
-        let mut out = Vec::new();
-        if self.kind() != NodeKind::Element {
-            return out;
-        }
-        let xml = self.doc.is_xml();
-        let mut a = unsafe { ffi::nw_first_attr(self.raw) };
-        while !a.is_null() {
-            let (mut nl, mut vl) = (0, 0);
-            let name = if xml {
-                unsafe { str_at(ffi::nw_attr_qname(a, &mut nl), nl) }
-            } else {
-                unsafe { str_at(ffi::nw_attr_name(a, &mut nl), nl) }
-            };
-            let value = unsafe { str_at(ffi::nw_attr_value(a, &mut vl), vl) };
-            out.push((name, value));
-            a = unsafe { ffi::nw_next_attr(a) };
-        }
-        out
+        self.tree()
+            .attrs(self.id)
+            .map(|(_, name, value)| (name, value))
+            .collect()
     }
 
     /// The node's own text, for text and comment nodes, and a processing
     /// instruction's data.
     pub fn data(&self) -> Option<&'a str> {
-        match self.kind() {
-            NodeKind::Text | NodeKind::Comment | NodeKind::ProcessingInstruction => {
-                let mut len = 0;
-                Some(unsafe { str_at(ffi::nw_char_data(self.raw, &mut len), len) })
-            }
+        match self.tree().kind(self.id) {
+            html::Kind::Text(t) | html::Kind::Cdata(t) | html::Kind::Comment(t) => Some(t),
+            html::Kind::ProcessingInstruction { data, .. } => Some(data),
             _ => None,
         }
     }
 
-    /// lexbor's id for this node's name. Two elements share an id exactly
-    /// when their lowercase names are equal.
+    /// An id for this node's name. Two elements share an id exactly when
+    /// their lowercase names (without an XML prefix) are equal.
     pub(crate) fn tag_id(&self) -> usize {
-        unsafe { ffi::nw_tag_id(self.raw) }
+        let index = self.doc.index();
+        index.tag_at(index.order(self.id))
     }
 
     /// The id elements named `name` (compared lowercased) carry in this
     /// node's document; `None` if no element has that name.
     pub(crate) fn tag_id_named(&self, name: &str) -> Option<usize> {
-        let id = unsafe { ffi::nw_tag_id_named(self.raw, name.as_ptr().cast(), name.len()) };
-        (id != 0).then_some(id)
+        self.doc.index().tag_id_named(name)
     }
 
     pub fn next_sibling(&self) -> Option<Node<'a>> {
-        Node::wrap(self.doc, unsafe { ffi::nw_next(self.raw) })
+        self.wrap(self.tree().next_sibling(self.id))
     }
 
     pub fn prev_sibling(&self) -> Option<Node<'a>> {
-        Node::wrap(self.doc, unsafe { ffi::nw_prev(self.raw) })
+        self.wrap(self.tree().prev_sibling(self.id))
     }
 
     pub fn first_child(&self) -> Option<Node<'a>> {
-        Node::wrap(self.doc, unsafe { ffi::nw_first_child(self.raw) })
+        self.wrap(self.tree().first_child(self.id))
     }
 
     pub fn last_child(&self) -> Option<Node<'a>> {
-        Node::wrap(self.doc, unsafe { ffi::nw_last_child(self.raw) })
+        self.wrap(self.tree().last_child(self.id))
     }
 
     /// The node after this one in document order: its first child, or the
@@ -1245,7 +1146,7 @@ impl<'a> Node<'a> {
 
     /// The node's position in document order: smaller comes first.
     pub fn order(&self) -> u32 {
-        self.doc.order_of(self.raw)
+        self.doc.order_of(self.id)
     }
 
     /// The node as HTML (as XML, in an XML document): an element with its
@@ -1255,29 +1156,13 @@ impl<'a> Node<'a> {
         if let Some(names) = self.doc.xml_names() {
             return xml::serialize(*self, names);
         }
-        extern "C" fn push(data: *const c_char, len: usize, ctx: *mut c_void) {
-            // SAFETY: lexbor passes `len` valid bytes; ctx is the Vec below.
-            let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len) };
-            unsafe { (*ctx.cast::<Vec<u8>>()).extend_from_slice(bytes) }
-        }
-        let mut out: Vec<u8> = Vec::new();
-        // Only fails when lexbor cannot allocate; return what was written.
-        unsafe { ffi::nw_serialize(self.raw, push, (&mut out as *mut Vec<u8>).cast()) };
-        // lexbor writes UTF-8; anything else would be memory corruption.
-        String::from_utf8(out).unwrap_or_default()
+        self.tree().outer_html(self.id)
     }
 
     /// The node alone as HTML: an element's start tag, escaped text, a
     /// comment or a doctype.
     fn html_alone(&self) -> String {
-        extern "C" fn push(data: *const c_char, len: usize, ctx: *mut c_void) {
-            // SAFETY: lexbor passes `len` valid bytes; ctx is the Vec below.
-            let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len) };
-            unsafe { (*ctx.cast::<Vec<u8>>()).extend_from_slice(bytes) }
-        }
-        let mut out: Vec<u8> = Vec::new();
-        unsafe { ffi::nw_serialize_one(self.raw, push, (&mut out as *mut Vec<u8>).cast()) };
-        String::from_utf8(out).unwrap_or_default()
+        self.tree().html_alone(self.id)
     }
 
     /// The node as indented HTML, one tag or piece of text to a line, one
@@ -1347,36 +1232,44 @@ impl<'a> Node<'a> {
     }
 
     pub fn parent(&self) -> Option<Node<'a>> {
-        Node::wrap(self.doc, unsafe { ffi::nw_parent(self.raw) })
+        self.wrap(self.tree().parent(self.id))
     }
 
     pub fn children(&self) -> impl Iterator<Item = Node<'a>> + use<'a> {
+        // The tree is looked up afresh at each step: an edit on this
+        // thread may change it between them.
         let doc = self.doc;
-        std::iter::successors(
-            Node::wrap(doc, unsafe { ffi::nw_first_child(self.raw) }),
-            move |n| Node::wrap(doc, unsafe { ffi::nw_next(n.raw) }),
-        )
+        let mut next = doc.tree().first_child(self.id);
+        std::iter::from_fn(move || {
+            let id = next?;
+            next = doc.tree().next_sibling(id);
+            Some(Node { doc, id })
+        })
     }
 
     /// Every node below this one, in document order.
     pub fn descendants(&self) -> impl Iterator<Item = Node<'a>> + use<'a> {
         let doc = self.doc;
-        let top = self.raw;
-        let mut next = unsafe { ffi::nw_first_child(top) };
+        let top = self.id;
+        let mut next = doc.tree().first_child(top);
         std::iter::from_fn(move || {
-            let current = Node::wrap(doc, next)?;
-            next = unsafe { ffi::nw_first_child(current.raw) };
-            let mut up = current.raw;
-            while next.is_null() && up != top {
-                next = unsafe { ffi::nw_next(up) };
-                up = unsafe { ffi::nw_parent(up) };
+            let tree = doc.tree();
+            let current = next?;
+            next = tree.first_child(current);
+            let mut up = Some(current);
+            while next.is_none() {
+                let Some(u) = up.filter(|&u| u != top) else {
+                    break;
+                };
+                next = tree.next_sibling(u);
+                up = tree.parent(u);
                 // An edit on this thread took `current` out of the tree
                 // mid-walk: stop rather than climb past its old place.
-                if up.is_null() {
+                if up.is_none() {
                     break;
                 }
             }
-            Some(current)
+            Some(Node { doc, id: current })
         })
     }
 
@@ -1404,14 +1297,14 @@ impl<'a> Node<'a> {
             next = if !skip { n.first_child() } else { None }.or_else(|| {
                 let mut at = n;
                 loop {
-                    if at.raw == self.raw {
+                    if at.id == self.id {
                         return None;
                     }
                     if let Some(s) = at.next_sibling() {
                         return Some(s);
                     }
                     at = at.parent()?;
-                    if at.raw == self.raw {
+                    if at.id == self.id {
                         return None;
                     }
                 }
@@ -1443,7 +1336,7 @@ impl<'a> Node<'a> {
 
 impl PartialEq for Node<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.raw == other.raw
+        self.id == other.id && std::ptr::eq(self.doc, other.doc)
     }
 }
 
@@ -1651,25 +1544,5 @@ mod tests {
                 t.join().unwrap();
             }
         }
-    }
-
-    fn shape(doc: &Document) -> Vec<String> {
-        doc.root()
-            .descendants()
-            .map(|n| format!("{:?}{:?}", n, n.attrs()))
-            .collect()
-    }
-
-    #[test]
-    fn tiny_chunks_build_the_same_tree_as_one_chunk() {
-        // 7-byte chunks split tags, entities, attribute values and multi-byte
-        // characters at every offset.
-        let html = "<!doctype html><p class=\"a b\">é€😀 &amp; &eacute;</p>\
-                    <script>if (a < b) {}</script><textarea>x<y</textarea>\
-                    <table>t<tr><td>c</table><svg><path d=\"M0 0\"/></svg>"
-            .repeat(50);
-        let one = parse_in_chunks(&html, Duration::MAX, usize::MAX).unwrap();
-        let small = parse_in_chunks(&html, Duration::MAX, 7).unwrap();
-        assert_eq!(shape(&one), shape(&small));
     }
 }

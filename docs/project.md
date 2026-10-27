@@ -245,9 +245,8 @@ docstring. The words after the name are `self.args`.
 ## version
 
 `netweir version` prints the version. `-v` adds Python's, the platform,
-the Rust compiler that built Netweir, the version of lexbor (the HTML
-parser) and the browser profiles built in, which is what a bug report
-needs.
+the Rust compiler that built Netweir, the version of its HTML parser and
+the browser profiles built in, which is what a bug report needs.
 
 ## Coming from Scrapy
 

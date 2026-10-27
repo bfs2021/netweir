@@ -14,35 +14,40 @@ The user-facing description is in [selecting.md](../selecting.md).
 Before this, a document never changed after parsing, and a lot leaned on
 that:
 
-- A Python `Node` is an `Arc<Document>` and a lexbor node pointer. So is
+- A Python `Node` is an `Arc<Document>` and a node id. So is
   every entry of a `Selection`, and the declarative and tracking code
   hold the same pointers while they run.
 - Queries, `.text`, `.html`, metadata and the rest release the GIL and
   read the tree on whatever thread they're on. On free-threaded Python
   (we ship a 3.14t wheel) nothing holds the GIL at all.
-- The document index stores node pointers, parent and subtree-end
-  positions, and writes each node's position into lexbor's `user` field.
-  XPath and document order read it.
-- `Node<'a>` hands out `&'a str` borrowed from lexbor's memory: tag
-  names, attribute values, text.
+- The document index stores node ids, parent and subtree-end positions,
+  and each node's position in a table by node id. XPath and document
+  order read it.
+- `Node<'a>` hands out `&'a str` borrowed from the document: tag names,
+  attribute values, text.
 
 Editing has to keep every one of those safe, without making read-only
 pages pay for it.
 
 ### Nothing is freed until the document is
 
-lexbor lets you destroy a node (`lxb_dom_node_destroy_deep`) or just
-unlink it (`lxb_dom_node_remove`). We only ever unlink. A removed node
-stays in lexbor's arena, still complete, until the document is dropped
-and the arena with it. That one rule makes handles safe: a pointer to a
-removed node, or to anything inside it, points at a valid, unchanged node
-for as long as any `Arc<Document>` keeps the document alive. No
-generation counters, no lookup table, no check on every access.
+The tree is netweir-html's: every node in one arena, linked by index.
+Removing a node unlinks it and nothing more. It stays in the arena,
+still complete, until the document is dropped. That one rule makes
+handles safe: the id of a removed node, or of anything inside it, names
+a valid, unchanged node for as long as any `Arc<Document>` keeps the
+document alive. No generation counters, no lookup table, no check on
+every access.
 
-The same goes for strings. No edit changes an existing node's text or
-attributes in place: `.string = ...` removes the children and adds a new
-text node, and attributes are only set on elements `new_tag()` has just
-made. So an `&'a str` borrowed before an edit still reads what it read.
+Strings are the subtle part, because an arena can move what it holds
+when it grows. The parser's strings never move once the parse is done:
+text that needed no change is a slice of the document's copy of its
+source, and the rest is in a buffer that only the parse writes. A string
+an edit adds gets an allocation of its own, which never moves either
+(netweir-html's `push_stable`; a test holds pointers across 10,000 edits
+and fails if one does). So an `&'a str` borrowed before an edit still
+reads what it read, even though the node and attribute vectors may have
+grown and moved.
 
 The price is memory: `decompose()` returns nothing to the allocator until
 the page goes. Pages live for one callback, so that's the right trade.
@@ -51,17 +56,11 @@ Given that, a removed node can be readable rather than an error, so it
 is: it reads as it was, with no parent. That's kinder than Beautiful
 Soup, where touching a decomposed tag is undefined in practice.
 
-The edits use lexbor's `_wo_events` relinking functions. The ordinary
-ones call mutation callbacks the HTML document can register; we register
-none, but the callbacks are where lexbor would free or update other
-state, and skipping them keeps "only pointers change" true by
-construction.
-
 ### Readers and edits
 
-An edit relinks nodes and can add tag and attribute names to lexbor's
-per-document tables. A reader on another thread walking the same links
-or looking up the same tables would race with it. So each document has a
+An edit relinks nodes and can grow the arena's vectors, which moves
+them. A reader on another thread walking the same links would race with
+it. So each document has a
 small reader/writer lock: an `AtomicU32` holding a reader count and two
 flags.
 
@@ -169,9 +168,10 @@ instead of following a null pointer.
   anything, the index after edits, readers on four threads against a
   writer, and a stress test of 2,000 random edits that keeps every
   handle it ever took and reads them all repeatedly.
-- The same tests pass under AddressSanitizer (Rust side; Apple's clang
-  and Rust's sanitizer runtimes don't link together for the C side). Miri
-  can't run lexbor's C.
+- The tree is Rust now. The unsafe code left is the document handing its
+  tree to readers and edits through an `UnsafeCell` (the lock above
+  decides who), and the parser borrowing the document's own source while
+  it fills the document (netweir-html's `source`).
 - A fuzz target, `edit`, applies any sequence of edits to a page and
   checks after each that the index agrees with a walk of the tree and that
   every node ever seen still reads: 129,000 runs under AddressSanitizer
@@ -189,18 +189,17 @@ rebuilds the whole index each turn.
 
 ### What's left out
 
-Setting or deleting one attribute would change memory that a borrowed
-`&str` may point at, so it would need copying strings out or another
-level of indirection. It isn't in this milestone. `insert_before`,
+Setting or deleting one attribute is safe in the tree (attributes are
+copied on write and an edit's strings never move), but it isn't exposed
+to Python yet. `insert_before`,
 `insert_after`, `extend`, `wrap` and `new_string` are all thin wrappers
 over `insert()`, `replace_with()` and strings, and were left until
 someone asks.
 
 `new_tag()` always makes an HTML-namespace element and lowercases
 attribute names. Creating the element in its future parent's namespace
-would mean choosing the namespace at insertion, after creation, which
-lexbor doesn't support without rebuilding the element; scrapers read
-pages rather than render them, so it's a documented limit.
+would mean choosing the namespace at insertion, after creation; scrapers
+read pages rather than render them, so it's a documented limit.
 
 ## find_similar
 
@@ -218,8 +217,8 @@ for the same reason. The default threshold, 0.5, lets a card carry one
 extra class (`card sale`) and shuts out a sibling that only shares a
 generic one.
 
-Steps 1 and 2 run on the index as integer work: tag ids are lexbor's
-interned ids, and the ancestor walk compares parent positions and tag ids,
+Steps 1 and 2 run on the index as integer work: tag ids are small
+integers (the parser's tag numbers, and interned names for the rest), and the ancestor walk compares parent positions and tag ids,
 stopping as soon as the two chains meet at a shared ancestor, which for
 siblings is the first step. Only survivors have their attributes read,
 and features are borrowed `&str`s, so nothing is allocated per candidate
@@ -267,7 +266,7 @@ does, so a list result stays the list it was.
 how most people pull items out of a page, and it's what parsel's docs
 show. Every call used to compile its query from scratch. On one small
 card, that was most of the bill. Here's where 3.3 µs went, for that call on
-the generated shop page:
+the generated shop page, when selectors were lexbor's:
 
 | | Before | After |
 |---|---|---|
@@ -275,6 +274,10 @@ the generated shop page:
 | Making and freeing lexbor's matcher | 0.4 µs | 0 |
 | Matching inside the card | 0.4 µs | 0.4 µs |
 | Python call, `Selection`, `get()`'s string | 0.3 µs | 0.3 µs |
+
+Netweir's own selector engine, which replaced lexbor's, compiles that
+selector in 0.46 µs and matches inside the card in 0.21 µs, with no
+matcher to make. The cache still saves the compile.
 
 XPath was gentler, since our parser is ours and cheap, but compiling was
 still about half of a 2.2 µs `.//p[@class='price_color']/text()`.
@@ -284,8 +287,8 @@ are bound when the query runs, not when it's compiled, so they aren't part
 of the key, and there are no namespaces to key on. Errors aren't cached;
 they raise, and nobody loops over a query that raises.
 
-**Per thread, not shared.** A compiled `Query` is safe to share (its
-`Sync` comment has the lexbor reading), so this is about speed. A shared
+**Per thread, not shared.** A compiled `Query` is plain data and safe to
+share, so this is about speed. A shared
 map needs a lock, and on free-threaded Python every query from every
 thread would take it. A thread-local map takes none. The cost is
 duplication: each thread compiles its own copy of the queries it uses.
@@ -297,11 +300,11 @@ memory grows with its text:
 
 | Query | Memory |
 |---|---|
-| `h3 a::attr(title)` | 6.3 KB |
-| 60 comma-separated selectors (2 KB of text) | 45 KB |
-| `:is()` with 400 branches | 99 KB |
+| `h3 a::attr(title)` | 1.1 KB |
+| 60 comma-separated selectors (1.6 KB of text) | 58 KB |
+| `:is()` with 400 branches | 195 KB |
 | a typical XPath | 1.5 KB |
-| densest CSS or XPath (`a,a,a,...`, stacked predicates) | about 130 bytes per byte of text |
+| densest CSS or XPath (`a,a,a,...`, stacked predicates) | up to about 130 bytes per byte of text |
 
 Ordinary queries hit the count first: a full pair of caches is about
 0.5 MB per thread. Pathological ones hit the text limit: about 1.1 MB per
@@ -313,31 +316,15 @@ selector) thrashes an LRU just as badly, and hot queries cost one compile
 each to come back. If a real workload has more than 64 hot queries, LRU is
 the upgrade.
 
-The 6 KB used to be 80 KB, which would have made a full cache 5 MB a
-thread. lexbor's default memory for a selector list
-(`lxb_css_memory_init`) is sized for a stylesheet, and most of it isn't
-the arenas but the free-block index inside each of its two `mraw`
-allocators: `lexbor_mraw_init` always gives that index room for 512
-entries, about 28 KB apiece, before anything is freed. A compiled list
-frees next to nothing. So the shim builds the memory itself
-(`nw_css_memory_new`): 1 KB arenas, room for 16 selector objects and an
-8-entry free-block index, each of which grows if a long selector needs
-it. And one query gets one memory, shared by all its comma-separated
-parts (each part is compiled separately, for its own `::text` or
-`::attr()` ending). With a memory per part, a 60-selector list held
-376 KB; shared, 45 KB. The query frees the memory, and with it every
-part's list, when it's dropped.
+With lexbor's selectors a short query held 6 KB, after the shim cut
+lexbor's default 80 KB down; Netweir's engine holds about 1 KB for one,
+and long lists cost about 70 bytes per byte of text.
 
-**The matcher.** `nw_select` used to create and destroy an
-`lxb_selectors_t` on every call, which cost more than the match. Each
-thread now keeps one, and `nw_select` cleans it after each run
-(`lxb_selectors_clean` keeps the first block of its two arenas and frees
-the rest), so a big query doesn't leave a big matcher behind. A thread
-never uses its matcher twice at once: nothing a match calls reaches back
-into `select`. (The document's `select_lock` went later, as lexbor's
-matching only reads the document: [threads.md](threads.md).) It's made on a thread's first query; if lexbor can't
-allocate it, `Query::try_run` returns `OutOfMemory` (Python sees
-`MemoryError`) and the next query tries again.
+**The matcher.** With lexbor, each thread kept one `lxb_selectors_t`,
+because making one cost more than a match. Netweir's engine matches with
+no state beyond the call's own stack, so there's nothing to keep, and
+nothing to fail to allocate: `Query::try_run` still returns a `Result`
+for its callers, but it's always `Ok`.
 
 XPath's `run_with` also stopped walking the expression for `$variables` on
 every call; `XPath::new` lists them once.

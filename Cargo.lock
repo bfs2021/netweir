@@ -1245,8 +1245,8 @@ dependencies = [
 name = "netweir-dom"
 version = "0.4.0"
 dependencies = [
- "cc",
  "memchr",
+ "netweir-html",
  "quick-xml",
  "regex",
  "serde",
@@ -1267,6 +1267,14 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-rustls",
+]
+
+[[package]]
+name = "netweir-html"
+version = "0.4.0"
+dependencies = [
+ "memchr",
+ "serde_json",
 ]
 
 [[package]]

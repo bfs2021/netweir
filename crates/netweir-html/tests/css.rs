@@ -1,0 +1,238 @@
+//! CSS selectors: every feature Netweir's own tests use, the rest of what
+//! lexbor offered, and where browsers and lexbor part ways, the browsers.
+
+use netweir_html::css::SelectorList;
+use netweir_html::{Document, Kind, NodeId, parse};
+
+const PAGE: &str = r#"<!DOCTYPE html><html><head><title>Shop</title></head><body>
+<div id="main" class="Wide page">
+  <h1>Books</h1>
+  <ul>
+    <li class="item first" data-id="17"><a href="/p/1" title="Book A, B">A</a></li>
+    <li class="item sold" data-id="27"><a href="/p/2">B</a><span class="price">£2</span></li>
+    <li class="item" data-id="30"><a href="https://x.example/p/3" hreflang="en-GB">C</a></li>
+    <li class="item last"><p></p><p> </p><p><!--c--></p></li>
+  </ul>
+  <form><fieldset disabled><legend><input name="in-legend"></legend><input name="off"></fieldset>
+    <input type="checkbox" checked name="box"><input type="TEXT" required readonly name="ro">
+    <select><optgroup disabled><option>x</option></optgroup><option selected>y</option></select>
+    <textarea placeholder="say"></textarea><input placeholder="p" value="v">
+  </form>
+  <svg viewBox="0 0 1 1"><clipPath id="cp"></clipPath><rect/></svg>
+</div></body></html>"#;
+
+fn names(doc: &Document, nodes: &[NodeId]) -> Vec<String> {
+    nodes
+        .iter()
+        .map(|&n| {
+            let Kind::Element { name, .. } = doc.kind(n) else {
+                unreachable!()
+            };
+            let id = doc
+                .attrs(n)
+                .find(|(_, a, _)| *a == "id" || *a == "name" || *a == "data-id")
+                .map(|(_, _, v)| format!("#{v}"))
+                .unwrap_or_default();
+            format!("{name}{id}")
+        })
+        .collect()
+}
+
+fn select(html: &str, css: &str) -> Vec<String> {
+    let doc = parse(html, false);
+    let list = SelectorList::parse(css).unwrap_or_else(|e| panic!("{css}: {e}"));
+    names(&doc, &list.select(&doc, doc.root()))
+}
+
+fn page(css: &str) -> Vec<String> {
+    select(PAGE, css)
+}
+
+#[test]
+fn simple_selectors_and_combinators() {
+    assert_eq!(page("h1"), ["h1"]);
+    assert_eq!(page("li.item.sold"), ["li#27"]);
+    assert_eq!(page("#main > h1"), ["h1"]);
+    assert_eq!(page("ul a"), ["a", "a", "a"]);
+    assert_eq!(page("li.first + li"), ["li#27"]);
+    assert_eq!(page("li.first ~ li"), ["li#27", "li#30", "li"]);
+    assert_eq!(page("*").len(), page("html, html *").len());
+    assert_eq!(page("h1, #main > h1, h1:not(p)"), ["h1"]);
+    assert_eq!(page(r"#a\:b, .w-1\/2, #\39 lives"), Vec::<String>::new());
+}
+
+#[test]
+fn attribute_selectors() {
+    assert_eq!(page("[data-id]"), ["li#17", "li#27", "li#30"]);
+    assert_eq!(page("a[href^='/']"), ["a", "a"]);
+    assert_eq!(page("[data-id$='7']"), ["li#17", "li#27"]);
+    assert_eq!(page("a[href*='/p/']").len(), 3);
+    assert_eq!(page("[class~=sold]"), ["li#27"]);
+    assert_eq!(page("[class~='']"), Vec::<String>::new());
+    assert_eq!(page("[hreflang|=en]"), ["a"]);
+    assert_eq!(page("a[title='Book A, B']"), ["a"]);
+    assert_eq!(page("[data-id=\"17\"]"), ["li#17"]);
+    assert_eq!(page("[class='ITEM FIRST' i]"), ["li#17"]);
+    assert_eq!(page("[href^='']"), Vec::<String>::new());
+}
+
+#[test]
+fn html_lists_attributes_whose_values_ignore_case() {
+    assert_eq!(page("input[type=text]"), ["input#ro"]);
+    assert_eq!(page("input[type=text s]"), Vec::<String>::new());
+    assert_eq!(page("[data-id='17' s]"), ["li#17"]);
+}
+
+#[test]
+fn ids_and_classes_compare_exactly_unless_quirks() {
+    assert_eq!(page(".wide"), Vec::<String>::new());
+    assert_eq!(page(".Wide"), ["div#main"]);
+    let quirky = "<div id=X class=Y></div>";
+    assert_eq!(select(quirky, "#x"), ["div#X"]);
+    assert_eq!(select(quirky, ".y"), ["div#X"]);
+    assert_eq!(
+        select(&format!("<!DOCTYPE html>{quirky}"), "#x"),
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn type_selectors_ignore_case_for_html_only() {
+    assert_eq!(page("H1"), ["h1"]);
+    assert_eq!(page("clipPath"), ["clipPath#cp"]);
+    assert_eq!(page("clippath"), Vec::<String>::new());
+    assert_eq!(page("[viewBox]"), ["svg"]);
+    assert_eq!(page("[viewbox]"), Vec::<String>::new());
+    assert_eq!(page("*|rect"), ["rect"]);
+    assert_eq!(page("|rect, |*"), Vec::<String>::new());
+}
+
+/// As in a browser, `[href]` means an href in no namespace; SVG's
+/// `xlink:href` takes `[*|href]`. Lexbor matched both.
+#[test]
+fn plain_attribute_names_mean_no_namespace() {
+    let svg = "<svg><use xlink:href=#a></use><a href=b></a></svg>";
+    assert_eq!(select(svg, "[href]"), ["a"]);
+    assert_eq!(select(svg, "[*|href]"), ["use", "a"]);
+}
+
+#[test]
+fn child_index_pseudo_classes() {
+    assert_eq!(page("li:nth-child(2)"), ["li#27"]);
+    assert_eq!(page("li:nth-child(odd)"), ["li#17", "li#30"]);
+    assert_eq!(page("li:nth-child(2n + 2)"), ["li#27", "li"]);
+    assert_eq!(page("li:nth-child(-n+2)"), ["li#17", "li#27"]);
+    assert_eq!(page("li:nth-last-child(1)"), ["li"]);
+    assert_eq!(page("li:nth-child(2 of .item:not(.sold))"), ["li#30"]);
+    assert_eq!(page("li:first-child"), ["li#17"]);
+    assert_eq!(page("li:last-child"), ["li"]);
+    assert_eq!(page("p:nth-of-type(2)"), ["p"]);
+    assert_eq!(page("p:last-of-type"), ["p"]);
+    assert_eq!(page("h1:only-of-type, title:only-child"), ["title", "h1"]);
+    assert_eq!(page("li:nth-child(0)"), Vec::<String>::new());
+}
+
+#[test]
+fn logical_pseudo_classes() {
+    assert_eq!(page(":is(h1, li.sold)"), ["h1", "li#27"]);
+    assert_eq!(page(":where(h1)"), ["h1"]);
+    assert_eq!(page(":is(h1, ::nonsense, )"), ["h1"]);
+    assert_eq!(page("li:not(.sold):not(.last)"), ["li#17", "li#30"]);
+    assert_eq!(page("li:has(.price)"), ["li#27"]);
+    assert_eq!(page("li:has(> a[href^=http])"), ["li#30"]);
+    assert_eq!(page("li:has(+ li.sold)"), ["li#17"]);
+    assert_eq!(page("li:has(~ .last)").len(), 3);
+    assert_eq!(page("ul:has(p:empty)"), ["ul"]);
+}
+
+#[test]
+fn state_and_structure_pseudo_classes() {
+    assert_eq!(page(":root"), ["html"]);
+    assert_eq!(page("p:empty").len(), 2);
+    assert_eq!(page("a:any-link, a:link").len(), 3);
+    assert_eq!(page(":checked"), ["input#box", "option"]);
+    assert_eq!(page("input:disabled"), ["input#off"]);
+    assert_eq!(page("option:disabled"), ["option"]);
+    assert_eq!(page("fieldset:disabled"), ["fieldset"]);
+    assert_eq!(page("input:enabled").len(), 4);
+    assert_eq!(page(":required"), ["input#ro"]);
+    assert_eq!(
+        page("input:read-only"),
+        ["input#off", "input#box", "input#ro"]
+    );
+    assert_eq!(page(":placeholder-shown"), ["textarea"]);
+    assert_eq!(page("a:hover, a:focus, a:visited"), Vec::<String>::new());
+}
+
+#[test]
+fn scope_is_the_element_a_query_runs_from() {
+    let doc = parse(PAGE, false);
+    let ul = SelectorList::parse("ul").unwrap().select(&doc, doc.root())[0];
+    let direct = SelectorList::parse(":scope > li.sold").unwrap();
+    assert_eq!(names(&doc, &direct.select(&doc, ul)), ["li#27"]);
+    // Combinators look past the scope, as in a browser.
+    let past = SelectorList::parse("div li.sold").unwrap();
+    assert_eq!(names(&doc, &past.select(&doc, ul)), ["li#27"]);
+    // The scope itself isn't a result.
+    assert!(
+        SelectorList::parse("ul")
+            .unwrap()
+            .select(&doc, ul)
+            .is_empty()
+    );
+}
+
+#[test]
+fn bad_selectors_are_errors() {
+    for bad in [
+        "",
+        "   ",
+        "div[",
+        "p >",
+        "##x",
+        "!!",
+        "a,",
+        ", a",
+        "a,,b",
+        "a::before",
+        "svg|rect",
+        "[xlink|href]",
+        ":nth-child(x)",
+        ":nth-of-type(2 of p)",
+        ":not()",
+        ":has()",
+        ":nope",
+        ":lexbor-contains('x')",
+        "a || b",
+        "[a=b c]",
+        "[a!=b]",
+    ] {
+        assert!(SelectorList::parse(bad).is_err(), "{bad:?} parsed");
+    }
+}
+
+/// Each nesting recursed in the parser, so a deep enough selector
+/// overflowed the stack and aborted the process; it's an error instead.
+#[test]
+fn deeply_nested_selectors_are_errors_not_crashes() {
+    let result = std::thread::Builder::new()
+        .stack_size(512 * 1024)
+        .spawn(|| {
+            let not = format!("{}a{}", ":not(".repeat(20_000), ")".repeat(20_000));
+            let is = format!("{}a{}", ":is(".repeat(5_000), ")".repeat(5_000));
+            {
+                // :is() forgives what it can't parse, so the too-deep part
+                // is dropped rather than failing the list: what matters is
+                // that neither overflows.
+                let _ = SelectorList::parse(&is);
+                (SelectorList::parse(&not).is_err(), true)
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(result, (true, true));
+    // Reasonable nesting still works.
+    let ok = format!("{}a{}", ":not(".repeat(20), ")".repeat(20));
+    assert!(SelectorList::parse(&ok).is_ok());
+}

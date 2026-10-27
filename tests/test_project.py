@@ -539,6 +539,27 @@ def test_parse_with_a_callback_and_depth(base, shop, capsys):
     assert "{'extra': 'given', 'item': 'Item 9'}" in out and "# Requests" not in out
 
 
+def test_parse_follows_requests_with_their_cb_kwargs(base, shop, tmp_path, capsys):
+    path = write(
+        tmp_path / "kwargs.py",
+        """
+import netweir
+
+class Kwargs(netweir.Spider):
+    name = "kwargs"
+
+    def parse(self, page):
+        yield page.follow("/item/1", callback="item", cb_kwargs={"extra": "passed"})
+
+    def item(self, page, extra):
+        yield {"item": page.css("h1::text").get(), "extra": extra}
+""",
+    )
+    argv = ["parse", base + "/", "--spider", str(path), "-d", "2", *FAST]
+    assert _cli.main(argv) == 0
+    assert "{'extra': 'passed', 'item': 'Item 1'}" in capsys.readouterr().out
+
+
 def test_parse_with_rules(base, shop, capsys):
     argv = ["parse", base + "/", "--spider", "ruled", *FAST]
     # A start page: the rules give its links.
@@ -752,6 +773,6 @@ def test_version(capsys):
     assert capsys.readouterr().out == f"Netweir {netweir.__version__}\n"
     assert _cli.main(["version", "-v"]) == 0
     out = capsys.readouterr().out
-    for name in ("Netweir", "Python", "Platform", "Rust", "lexbor", "Profiles"):
+    for name in ("Netweir", "Python", "Platform", "Rust", "Parser", "Profiles"):
         assert name in out
     assert "chrome-" in out and "rustc " in out

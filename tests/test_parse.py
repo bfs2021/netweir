@@ -80,7 +80,10 @@ def test_nodes_outlive_their_selection():
 
 def test_timeout_stops_hostile_pages():
     with pytest.raises(netweir.ParseTimeout):
-        netweir.parse("<div>" * 200_000, timeout=0.2)
+        netweir.parse("<div><b>x</b> y</div>" * 200_000, timeout=0.0001)
+    # Deep nesting, which took seconds before Netweir had its own parser,
+    # now parses well inside a timeout.
+    assert len(netweir.parse("<div>" * 200_000, timeout=5).css("div")) == 200_000
     with pytest.raises(ValueError):
         netweir.parse("<p>", timeout=-1)
     assert netweir.parse("<p>x</p>", timeout=5).css("p::text").get() == "x"

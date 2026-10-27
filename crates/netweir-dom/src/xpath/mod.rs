@@ -33,8 +33,8 @@ impl fmt::Display for XPathError {
 
 impl std::error::Error for XPathError {}
 
-/// A compiled XPath expression. Unlike [`crate::Query`] it holds no lexbor
-/// state, so one can be shared by many threads.
+/// A compiled XPath expression. It holds no state of any document, so one
+/// can be shared by many threads.
 #[derive(Debug, Clone)]
 pub struct XPath {
     src: String,

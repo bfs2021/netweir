@@ -556,3 +556,13 @@ fn a_kept_verdict_still_counts_positions() {
         ["Three"]
     );
 }
+
+#[test]
+fn a_prefixed_html_name_is_not_its_local_name() {
+    // HTML has no namespaces: Word's <o:p> is an element called "o:p", so
+    // //p must pass it by, as lxml does.
+    let doc = Document::parse("<p>one</p><o:p>two</o:p>");
+    let hits = XPath::new("//p").unwrap().run(doc.root()).unwrap();
+    let text: Vec<String> = hits.iter().map(Hit::to_string_value).collect();
+    assert_eq!(text, ["<p>one</p>"]);
+}

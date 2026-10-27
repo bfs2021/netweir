@@ -104,9 +104,9 @@ def main():
         type=float,
         default=0.15,
         help=(
-            "how much slower than selectolax --check allows. The two parse with the same"
-            " lexbor and run within a few %% of each other, which a shared CI runner's"
-            " noise can turn either way; the check is for netweir getting slower"
+            "how much slower than selectolax --check allows. Netweir's own parser is"
+            " about twice as fast as selectolax's lexbor, so this only trips on a real"
+            " slowdown, not on a shared CI runner's noise"
         ),
     )
     ap.add_argument("--runs", type=int, default=15)

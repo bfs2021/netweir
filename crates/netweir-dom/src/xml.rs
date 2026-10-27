@@ -1,5 +1,5 @@
 //! XML documents. quick-xml reads the markup and this module builds the
-//! tree in lexbor, as an HTML page's is built, so CSS, XPath, `get()` and
+//! tree in the same arena as an HTML page's, so CSS, XPath, `get()` and
 //! the rest of the API work on a feed or a sitemap as they do on a page.
 //!
 //! XML is a trust boundary, and parsing treats it as one:
@@ -31,7 +31,7 @@ use quick_xml::XmlVersion;
 use quick_xml::events::{BytesStart, Event};
 
 use crate::document::{Document, Node, NodeKind, ParseTimeout};
-use crate::ffi::{self, RawNode};
+use netweir_html as html;
 
 /// How deep elements may nest. lxml's limit with `huge_tree`, which
 /// Scrapy's selectors turn on.
@@ -87,15 +87,15 @@ impl fmt::Display for ParseXmlError {
 
 impl std::error::Error for ParseXmlError {}
 
-/// What an XML document knows that lexbor doesn't keep: namespaces.
-/// lexbor folds namespace URIs to lowercase, and XML compares them as
-/// written, so they live here, keyed by node.
+/// What an XML document knows that the HTML tree has no place for:
+/// element namespaces, compared as written, keyed by node.
 #[derive(Default)]
 pub(crate) struct XmlNames {
     /// Namespace URIs; id `i` is `uris[i - 1]`, and 0 is no namespace.
     uris: Vec<Box<str>>,
     ids: HashMap<Box<str>, u32>,
-    /// The namespace of each element or attribute that has one.
+    /// The namespace of each element that has one. (An attribute carries
+    /// its own, as `AttrNs::Host`.)
     ns: HashMap<usize, u32>,
     /// The `xmlns` declarations each element makes, in order: a prefix
     /// ("" for the default namespace) and a URI id (0 for `xmlns=""`).
@@ -137,7 +137,7 @@ impl XmlNames {
         }
     }
 
-    /// The namespace id of the element or attribute at `raw`.
+    /// The namespace id of the element at `raw`.
     pub(crate) fn ns_of(&self, raw: usize) -> u32 {
         self.ns.get(&raw).copied().unwrap_or(0)
     }
@@ -229,15 +229,12 @@ fn is_blank(s: &str) -> bool {
 
 /// HTML's named character `name` (`nbsp` gives U+00A0), if there is one.
 pub fn html_entity(name: &str) -> Option<String> {
-    let key = format!("{name};");
-    let mut len = 0;
-    let ptr = unsafe { ffi::nw_html_entity(key.as_ptr().cast(), key.len(), &mut len) };
-    (!ptr.is_null()).then(|| unsafe { ffi::str_at(ptr, len) }.to_string())
+    html::named_reference(&format!("{name};")).map(str::to_string)
 }
 
 /// Whether `name` is an element HTML has (`div`, `title`; not `rss`).
 pub fn is_html_tag(name: &str) -> bool {
-    unsafe { ffi::nw_is_html_tag(name.as_ptr().cast(), name.len()) != 0 }
+    html::is_html_element(name)
 }
 
 fn predefined(name: &str) -> Option<char> {
@@ -516,7 +513,7 @@ struct Open {
     /// How many namespace bindings were in scope before it.
     mark: usize,
     /// Its node, when it's part of what's being built.
-    node: *mut RawNode,
+    node: Option<u32>,
 }
 
 /// What reading gives: the whole document, each element with this
@@ -699,21 +696,23 @@ impl<'v> Builder<'v> {
     }
 
     /// The node new content goes into, if what's being read is being built.
-    fn parent(&self) -> Option<*mut RawNode> {
+    fn parent(&self) -> Option<u32> {
         let out = self.out.as_ref()?;
         if self.open.len() > out.depth {
-            self.open.last().map(|o| o.node)
+            self.open.last().and_then(|o| o.node)
         } else if matches!(self.want, Want::Whole) {
-            Some(unsafe { ffi::nw_root(out.doc.raw) })
+            Some(0)
         } else {
             None
         }
     }
 
-    fn append(&mut self, node: *mut RawNode) {
-        assert!(!node.is_null(), "lexbor failed to allocate an XML node");
-        if let Some(parent) = self.parent() {
-            unsafe { ffi::nw_append(parent, node) };
+    fn append(&mut self, node: u32) {
+        if let (Some(parent), Some(out)) = (self.parent(), self.out.as_mut()) {
+            out.doc
+                .tree_to_build()
+                .append(parent, node)
+                .expect("an XML element takes children");
         }
     }
 
@@ -723,9 +722,8 @@ impl<'v> Builder<'v> {
         }
         if let Some(visitor) = self.visitor.as_deref_mut() {
             visitor.text(&self.pending);
-        } else if let (Some(_), Some(out)) = (self.parent(), self.out.as_ref()) {
-            let t = &self.pending;
-            let n = unsafe { ffi::nw_create_text(out.doc.raw, t.as_ptr().cast(), t.len()) };
+        } else if let (Some(_), Some(out)) = (self.parent(), self.out.as_mut()) {
+            let n = out.doc.tree_to_build().create_text(&self.pending);
             self.append(n);
         }
         self.pending.clear();
@@ -790,16 +788,13 @@ impl<'v> Builder<'v> {
                 let data = p.content().trim_start_matches([' ', '\t', '\r', '\n']);
                 let data = self.clean(data)?.into_owned();
                 self.flush();
-                if let Some(out) = self.parent().and(self.out.as_ref()) {
-                    let n = unsafe {
-                        ffi::nw_create_pi(
-                            out.doc.raw,
-                            target.as_ptr().cast(),
-                            target.len(),
-                            data.as_ptr().cast(),
-                            data.len(),
-                        )
-                    };
+                if self.parent().is_some()
+                    && let Some(out) = self.out.as_mut()
+                {
+                    let n = out
+                        .doc
+                        .tree_to_build()
+                        .create_processing_instruction(target, &data);
                     self.append(n);
                 }
             }
@@ -807,10 +802,10 @@ impl<'v> Builder<'v> {
                 let text = c.xml_content(self.version());
                 let text = self.clean(&text)?.into_owned();
                 self.flush();
-                if let Some(out) = self.parent().and(self.out.as_ref()) {
-                    let n = unsafe {
-                        ffi::nw_create_comment(out.doc.raw, text.as_ptr().cast(), text.len())
-                    };
+                if self.parent().is_some()
+                    && let Some(out) = self.out.as_mut()
+                {
+                    let n = out.doc.tree_to_build().create_comment(&text);
                     self.append(n);
                 }
             }
@@ -1249,45 +1244,34 @@ impl<'v> Builder<'v> {
                 depth: self.open.len(),
             });
         }
-        let mut node = std::ptr::null_mut();
+        let mut node = None;
         let top = self
             .out
             .as_ref()
             .is_some_and(|o| o.depth == self.open.len());
         if let Some(out) = self.out.as_mut().filter(|o| self.open.len() >= o.depth) {
-            let raw = out.doc.raw;
-            node = unsafe {
-                ffi::nw_xml_element(
-                    raw,
-                    qname.as_ptr().cast(),
-                    qname.len(),
-                    qname.len() - local.len(),
-                )
-            };
-            assert!(!node.is_null(), "lexbor failed to allocate an XML element");
-            let names = out.doc.xml_names_mut();
+            let _ = &local;
+            let n = out
+                .doc
+                .tree_to_build()
+                .create_element(html::Ns::Xml, &qname);
+            node = Some(n);
             if !ns.is_empty() {
+                let names = out.doc.xml_names_mut();
                 let id = names.intern(&ns);
-                names.ns.insert(node as usize, id);
+                names.ns.insert(n as usize, id);
             }
             for (((key, value), uri), _) in
                 attrs.iter().zip(&attr_ns).zip(&keep).filter(|(_, k)| **k)
             {
-                let a = unsafe {
-                    ffi::nw_xml_attr(
-                        node,
-                        key.as_ptr().cast(),
-                        key.len(),
-                        value.as_ptr().cast(),
-                        value.len(),
-                    )
+                let attr_ns = if uri.is_empty() {
+                    html::AttrNs::None
+                } else {
+                    html::AttrNs::Host(out.doc.xml_names_mut().intern(uri))
                 };
-                assert!(!a.is_null(), "lexbor failed to allocate an XML attribute");
-                if !uri.is_empty() {
-                    let id = names.intern(uri);
-                    names.ns.insert(a as usize, id);
-                }
+                out.doc.tree_to_build().add_attr(n, attr_ns, key, value);
             }
+            let names = out.doc.xml_names_mut();
             // A node read alone keeps what the elements it was cut from
             // declared, nearest first, each in the order written, for
             // writing it out as it would be written from the whole.
@@ -1307,14 +1291,15 @@ impl<'v> Builder<'v> {
                     .iter()
                     .map(|(p, u)| (Box::from(p.as_str()), names.intern(u)))
                     .collect();
-                names.decls.insert(node as usize, decls);
+                names.decls.insert(n as usize, decls);
             }
+            let tree = out.doc.tree_to_build();
             if top {
                 // The node of its own document, or the root of the whole.
-                let parent = unsafe { ffi::nw_root(raw) };
-                unsafe { ffi::nw_append(parent, node) };
-            } else if let Some(parent) = self.open.last().map(|o| o.node) {
-                unsafe { ffi::nw_append(parent, node) };
+                tree.append(0, n).expect("a document takes its root");
+            } else if let Some(parent) = self.open.last().and_then(|o| o.node) {
+                tree.append(parent, n)
+                    .expect("an XML element takes children");
             }
         }
         if top {
@@ -1778,7 +1763,7 @@ fn start_tag(node: Node<'_>, names: &XmlNames, top: bool, out: &mut String) {
     out.push('<');
     out.push_str(node.qualified_name());
     let mut decls: Vec<(&str, u32)> = names
-        .decls_of(node.raw as usize)
+        .decls_of(node.id as usize)
         .iter()
         .map(|(p, u)| (&**p, *u))
         .collect();
@@ -1797,7 +1782,7 @@ fn start_tag(node: Node<'_>, names: &XmlNames, top: bool, out: &mut String) {
         while let Some(a) = up {
             decls.extend(
                 names
-                    .decls_of(a.raw as usize)
+                    .decls_of(a.id as usize)
                     .iter()
                     .map(|(p, u)| (&**p, *u)),
             );
