@@ -60,6 +60,9 @@ enum Simple {
     Type {
         lower: String,
         exact: String,
+        /// The lowercased name as a known tag, so HTML elements compare
+        /// by number.
+        tag: Tag,
     },
     Id(String),
     Class(String),
@@ -398,19 +401,13 @@ impl<'a> Parser<'a> {
                 let none = !star;
                 if !self.eat('*') {
                     let local = self.ident()?;
-                    simple.push(Simple::Type {
-                        lower: local.to_ascii_lowercase(),
-                        exact: local,
-                    });
+                    simple.push(type_selector(local));
                 }
                 if none {
                     simple.push(Simple::Pseudo(Pseudo::Never));
                 }
             } else if !star {
-                simple.push(Simple::Type {
-                    lower: name.to_ascii_lowercase(),
-                    exact: name,
-                });
+                simple.push(type_selector(name));
             }
         }
         loop {
@@ -683,6 +680,15 @@ fn an_plus_b(text: &str) -> Result<(i32, i32), SelectorError> {
     Ok((a, b))
 }
 
+fn type_selector(name: String) -> Simple {
+    let lower = name.to_ascii_lowercase();
+    Simple::Type {
+        tag: Tag::from_name(&lower),
+        lower,
+        exact: name,
+    }
+}
+
 fn nth(a: i32, b: i32, last: bool, of_type: bool) -> Pseudo {
     Pseudo::Nth {
         a,
@@ -723,15 +729,32 @@ impl SelectorList {
             scope: Some(scope),
         };
         let mut out = Vec::new();
-        let mut stack: Vec<NodeId> = Vec::new();
-        push_children_reversed(doc, scope, &mut stack);
-        while let Some(n) = stack.pop() {
-            if doc.element(n).is_some() {
-                if self.0.iter().any(|c| cx.complex(c, 0, n, n)) {
-                    out.push(n);
-                }
-                push_children_reversed(doc, n, &mut stack);
+        // A walk by the tree's own links, in document order: down to the
+        // first child, else along to the next sibling, else back up.
+        let mut at = doc.first_child(scope);
+        while let Some(n) = at {
+            let element = doc.element(n).is_some();
+            if element && self.0.iter().any(|c| cx.complex(c, 0, n, n)) {
+                out.push(n);
             }
+            at = match doc.first_child(n).filter(|_| element) {
+                Some(child) => Some(child),
+                None => {
+                    let mut up = Some(n);
+                    let mut next = None;
+                    while let Some(u) = up {
+                        if u == scope {
+                            break;
+                        }
+                        if let Some(s) = doc.next_sibling(u) {
+                            next = Some(s);
+                            break;
+                        }
+                        up = doc.parent(u);
+                    }
+                    next
+                }
+            };
         }
         out
     }
@@ -887,12 +910,15 @@ impl Cx<'_> {
             return false;
         };
         compound.0.iter().all(|s| match s {
-            Simple::Type { lower, exact } => {
-                let name = self.doc.element_name(e);
+            Simple::Type { lower, exact, tag } => {
                 if e.ns == Ns::Html {
-                    name == lower
+                    if *tag != Tag::Other || e.tag != Tag::Other {
+                        e.tag == *tag
+                    } else {
+                        self.doc.element_name(e) == lower
+                    }
                 } else {
-                    name == exact
+                    self.doc.element_name(e) == exact
                 }
             }
             Simple::Id(id) => self.attr(el, "id").is_some_and(|v| self.quirks_eq(v, id)),
@@ -922,22 +948,24 @@ impl Cx<'_> {
     }
 
     fn attr_matches(&self, el: NodeId, ns: Ns, a: &AttrSelector) -> bool {
+        let doc = self.doc;
         let html = ns == Ns::Html;
         let insensitive = match a.case {
             Case::Insensitive => true,
             Case::Sensitive => false,
             Case::Default => html && case_insensitive_attr(&a.lower),
         };
-        self.doc.attrs(el).any(|(attr_ns, name, value)| {
-            if !(attr_ns == AttrNs::None || a.any_ns) {
-                return false;
-            }
-            let named = if html {
-                name == a.lower
-            } else {
-                name == a.exact
-            };
-            named && value_matches(a.op, value, &a.value, insensitive)
+        let want = if html { &a.lower } else { &a.exact };
+        let range = doc
+            .element(el)
+            .map_or(0..0, |e| e.attrs.start as usize..e.attrs.end as usize);
+        // The raw attributes, so a value is only looked at once the name
+        // matches.
+        doc.attrs[range].iter().any(|attr| {
+            (attr.ns == AttrNs::None || a.any_ns)
+                && doc.str(attr.name) == want.as_str()
+                && (a.op == AttrOp::Exists
+                    || value_matches(a.op, doc.str(attr.value), &a.value, insensitive))
         })
     }
 
@@ -959,8 +987,7 @@ impl Cx<'_> {
             } => {
                 let same = |other: NodeId| {
                     if *of_type {
-                        let o = doc.element(other).unwrap();
-                        o.ns == e.ns && doc.element_name(o) == doc.element_name(e)
+                        same_type(doc, doc.element(other).unwrap(), e)
                     } else if let Some(of) = of {
                         of.0.iter().any(|c| self.complex(c, 0, other, other))
                     } else {
@@ -979,6 +1006,12 @@ impl Cx<'_> {
                 while let Some(s) = at {
                     if same(s) {
                         index += 1;
+                        // With a <= 0 the positions that match end at b, so
+                        // counting further can't help: `:last-child` looks
+                        // at one sibling, not all of them.
+                        if *a <= 0 && index > *b as i64 {
+                            return false;
+                        }
                     }
                     at = if *last {
                         self.next_element(s)
@@ -989,12 +1022,8 @@ impl Cx<'_> {
                 nth_matches(*a as i64, *b as i64, index)
             }
             Pseudo::Only { of_type } => {
-                let same = |other: NodeId| {
-                    !*of_type || {
-                        let o = doc.element(other).unwrap();
-                        o.ns == e.ns && doc.element_name(o) == doc.element_name(e)
-                    }
-                };
+                let same =
+                    |other: NodeId| !*of_type || same_type(doc, doc.element(other).unwrap(), e);
                 let mut at = self.prev_element(el);
                 while let Some(s) = at {
                     if same(s) {
@@ -1187,6 +1216,16 @@ impl Cx<'_> {
         }
         false
     }
+}
+
+/// Same namespace and name: by tag number when the parser knows the tag.
+fn same_type(doc: &Document, a: &crate::dom::Element, b: &crate::dom::Element) -> bool {
+    a.ns == b.ns
+        && if a.tag != Tag::Other || b.tag != Tag::Other {
+            a.tag == b.tag && (a.ns == Ns::Html || doc.element_name(a) == doc.element_name(b))
+        } else {
+            doc.element_name(a) == doc.element_name(b)
+        }
 }
 
 fn nth_matches(a: i64, b: i64, index: i64) -> bool {
