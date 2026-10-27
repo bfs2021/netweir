@@ -34,6 +34,10 @@ pub enum Quirks {
     Quirks,
 }
 
+/// A span's high bit says it's in the document's copy of its source, not
+/// in the buffer of strings the parser had to make.
+const IN_SOURCE: u32 = 1 << 31;
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Span {
     pub start: u32,
@@ -101,6 +105,9 @@ pub(crate) struct Node {
 /// A parsed HTML document, or a fragment.
 pub struct Document {
     pub(crate) nodes: Vec<Node>,
+    /// The input, after preprocessing. Text and attribute values that
+    /// didn't need changing point into it rather than being copied.
+    pub(crate) src: Box<str>,
     pub(crate) buf: String,
     pub(crate) attrs: Vec<Attr>,
     pub(crate) quirks: Quirks,
@@ -141,7 +148,8 @@ impl Document {
         });
         Document {
             nodes,
-            buf: String::with_capacity(capacity / 2),
+            src: Box::default(),
+            buf: String::with_capacity(capacity / 8),
             attrs: Vec::with_capacity(capacity / 64 + 16),
             quirks: Quirks::No,
         }
@@ -164,7 +172,30 @@ impl Document {
     }
 
     pub(crate) fn str(&self, s: Span) -> &str {
-        &self.buf[s.start as usize..s.end as usize]
+        if s.start & IN_SOURCE != 0 {
+            &self.src[(s.start & !IN_SOURCE) as usize..(s.end & !IN_SOURCE) as usize]
+        } else {
+            &self.buf[s.start as usize..s.end as usize]
+        }
+    }
+
+    /// Where `s` is in the source, if it's a slice of it.
+    fn source_offset(&self, s: &str) -> Option<usize> {
+        let base = self.src.as_ptr() as usize;
+        let at = s.as_ptr() as usize;
+        (at >= base && at + s.len() <= base + self.src.len()).then(|| at - base)
+    }
+
+    /// A span for `s`: into the source when it's a slice of it, which
+    /// costs nothing, else a copy in the buffer.
+    pub(crate) fn intern(&mut self, s: &str) -> Span {
+        match self.source_offset(s) {
+            Some(at) => Span {
+                start: at as u32 | IN_SOURCE,
+                end: (at + s.len()) as u32 | IN_SOURCE,
+            },
+            None => self.push_str(s),
+        }
     }
 
     pub(crate) fn push_str(&mut self, s: &str) -> Span {
@@ -259,22 +290,35 @@ impl Document {
         let Data::Text(span) = self.nodes[id as usize].data else {
             unreachable!("not a text node")
         };
-        let span = if span.end as usize == self.buf.len() {
-            self.buf.push_str(text);
-            Span {
-                start: span.start,
-                end: self.buf.len() as u32,
-            }
-        } else {
-            let start = self.buf.len();
-            self.buf
-                .extend_from_within(span.start as usize..span.end as usize);
-            self.buf.push_str(text);
-            Span {
-                start: start as u32,
-                end: self.buf.len() as u32,
-            }
-        };
+        let in_source = span.start & IN_SOURCE != 0;
+        let span =
+            if in_source && self.source_offset(text) == Some((span.end & !IN_SOURCE) as usize) {
+                // The next slice of the source: the span just grows.
+                Span {
+                    start: span.start,
+                    end: span.end + text.len() as u32,
+                }
+            } else if !in_source && span.end as usize == self.buf.len() {
+                self.buf.push_str(text);
+                Span {
+                    start: span.start,
+                    end: self.buf.len() as u32,
+                }
+            } else {
+                let start = self.buf.len();
+                if in_source {
+                    let old = (span.start & !IN_SOURCE) as usize..(span.end & !IN_SOURCE) as usize;
+                    self.buf.push_str(&self.src[old]);
+                } else {
+                    self.buf
+                        .extend_from_within(span.start as usize..span.end as usize);
+                }
+                self.buf.push_str(text);
+                Span {
+                    start: start as u32,
+                    end: self.buf.len() as u32,
+                }
+            };
         self.nodes[id as usize].data = Data::Text(span);
     }
 

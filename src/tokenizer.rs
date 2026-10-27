@@ -7,7 +7,6 @@
 //! reported.
 
 use std::borrow::Cow;
-use std::ops::Range;
 
 use memchr::{memchr, memchr2, memchr3};
 
@@ -60,28 +59,47 @@ pub struct Tag<'a> {
     /// Lowercased, as the spec stores tag names.
     pub name: &'a str,
     pub self_closing: bool,
+    input: &'a str,
     buf: &'a str,
     attrs: &'a [Attr],
 }
 
 impl<'a> Tag<'a> {
     /// The attributes in source order, names lowercased, duplicates
-    /// dropped (the first one wins).
+    /// dropped (the first one wins). Each is a slice of the input when
+    /// nothing in it had to change.
     pub fn attrs(&self) -> Attrs<'a> {
         Attrs {
+            input: self.input,
             buf: self.buf,
             attrs: self.attrs.iter(),
         }
     }
 }
 
+/// A string the tokenizer read: a range of the input, or of its buffer.
+#[derive(Debug, Clone, Copy)]
+struct Text {
+    start: u32,
+    end: u32,
+    input: bool,
+}
+
+impl Text {
+    fn get<'a>(self, input: &'a str, buf: &'a str) -> &'a str {
+        let from = if self.input { input } else { buf };
+        &from[self.start as usize..self.end as usize]
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Attr {
-    name: Range<u32>,
-    value: Range<u32>,
+    name: Text,
+    value: Text,
 }
 
 pub struct Attrs<'a> {
+    input: &'a str,
     buf: &'a str,
     attrs: std::slice::Iter<'a, Attr>,
 }
@@ -92,8 +110,8 @@ impl<'a> Iterator for Attrs<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let a = self.attrs.next()?;
         Some((
-            &self.buf[a.name.start as usize..a.name.end as usize],
-            &self.buf[a.value.start as usize..a.value.end as usize],
+            a.name.get(self.input, self.buf),
+            a.value.get(self.input, self.buf),
         ))
     }
 
@@ -196,8 +214,9 @@ enum State {
 #[derive(Clone, Copy)]
 struct Current {
     name_start: usize,
-    name_end: usize,
+    name: Option<Text>,
     value_start: usize,
+    value: Option<Text>,
     duplicate: bool,
 }
 
@@ -208,11 +227,18 @@ pub struct Tokenizer<'a> {
     last_start_tag: String,
 
     tag_name: String,
+    /// The tag name as a slice of the input, while nothing in it needed
+    /// changing.
+    name_input: Option<(usize, usize)>,
     end_tag: bool,
     self_closing: bool,
     attr_buf: String,
     attrs: Vec<Attr>,
     current: Option<Current>,
+    attr_name_input: Option<(usize, usize)>,
+    /// Where the attribute value being read starts in the input, while it
+    /// is still an unchanged slice of it.
+    value_from: Option<usize>,
 
     comment: String,
 
@@ -241,11 +267,14 @@ impl<'a> Tokenizer<'a> {
             state: State::Data,
             last_start_tag: String::new(),
             tag_name: String::new(),
+            name_input: None,
             end_tag: false,
             self_closing: false,
             attr_buf: String::new(),
             attrs: Vec::new(),
             current: None,
+            attr_name_input: None,
+            value_from: None,
             comment: String::new(),
             pi_target: String::new(),
             pi_data: String::new(),
@@ -283,6 +312,7 @@ impl<'a> Tokenizer<'a> {
 
     fn new_tag(&mut self, end: bool) {
         self.tag_name.clear();
+        self.name_input = None;
         self.end_tag = end;
         self.self_closing = false;
         self.attr_buf.clear();
@@ -290,48 +320,138 @@ impl<'a> Tokenizer<'a> {
         self.current = None;
     }
 
+    /// Appends a run of the tag name: kept as a slice of the input when
+    /// it's the whole name so far and already lowercase.
+    fn push_tag_name(&mut self, start: usize, end: usize) {
+        let run = &self.input[start..end];
+        if self.tag_name.is_empty()
+            && self.name_input.is_none()
+            && !run.bytes().any(|b| b.is_ascii_uppercase())
+        {
+            self.name_input = Some((start, end));
+        } else {
+            self.flush_tag_name();
+            push_lower(&mut self.tag_name, run);
+        }
+    }
+
+    fn flush_tag_name(&mut self) {
+        if let Some((s, e)) = self.name_input.take() {
+            self.tag_name.push_str(&self.input[s..e]);
+        }
+    }
+
     fn start_attr(&mut self) {
         self.finish_attr();
         let at = self.attr_buf.len();
         self.current = Some(Current {
             name_start: at,
-            name_end: at,
+            name: None,
             value_start: at,
+            value: None,
             duplicate: false,
         });
+        self.attr_name_input = None;
+        self.value_from = None;
+    }
+
+    fn push_attr_name(&mut self, start: usize, end: usize) {
+        let run = &self.input[start..end];
+        let empty = self
+            .current
+            .is_some_and(|c| c.name_start == self.attr_buf.len())
+            && self.attr_name_input.is_none();
+        if empty && !run.bytes().any(|b| b.is_ascii_uppercase()) {
+            self.attr_name_input = Some((start, end));
+        } else {
+            self.flush_attr_name();
+            push_lower(&mut self.attr_buf, run);
+        }
+    }
+
+    fn flush_attr_name(&mut self) {
+        if let Some((s, e)) = self.attr_name_input.take() {
+            self.attr_buf.push_str(&self.input[s..e]);
+        }
     }
 
     /// On leaving the attribute name state: the spec drops an attribute
     /// whose name the tag already has.
     fn end_attr_name(&mut self) {
         let Some(mut c) = self.current else { return };
-        c.name_end = self.attr_buf.len();
-        c.value_start = c.name_end;
-        let name = &self.attr_buf[c.name_start..c.name_end];
+        let name = match self.attr_name_input.take() {
+            Some((s, e)) => Text {
+                start: s as u32,
+                end: e as u32,
+                input: true,
+            },
+            None => Text {
+                start: c.name_start as u32,
+                end: self.attr_buf.len() as u32,
+                input: false,
+            },
+        };
+        c.name = Some(name);
+        c.value_start = self.attr_buf.len();
+        let this = name.get(self.input, &self.attr_buf);
         c.duplicate = self
             .attrs
             .iter()
-            .any(|a| &self.attr_buf[a.name.start as usize..a.name.end as usize] == name);
+            .any(|a| a.name.get(self.input, &self.attr_buf) == this);
         self.current = Some(c);
+    }
+
+    /// The value so far, from the input, into the buffer: something in
+    /// it is about to change.
+    fn flush_value(&mut self, upto: usize) {
+        if let Some(s) = self.value_from.take() {
+            self.attr_buf.push_str(&self.input[s..upto]);
+        }
+    }
+
+    /// The value ends at `end`; if it never changed, it's that slice.
+    fn end_value(&mut self, end: usize) {
+        if let Some(s) = self.value_from.take()
+            && let Some(c) = self.current.as_mut()
+        {
+            c.value = Some(Text {
+                start: s as u32,
+                end: end as u32,
+                input: true,
+            });
+        }
     }
 
     fn finish_attr(&mut self) {
         let Some(c) = self.current.take() else { return };
         if c.duplicate {
             self.attr_buf.truncate(c.name_start);
-        } else {
-            self.attrs.push(Attr {
-                name: c.name_start as u32..c.name_end as u32,
-                value: c.value_start as u32..self.attr_buf.len() as u32,
-            });
+            return;
         }
+        let name = c.name.unwrap_or(Text {
+            start: c.name_start as u32,
+            end: c.name_start as u32,
+            input: false,
+        });
+        let value = c.value.unwrap_or(Text {
+            start: c.value_start as u32,
+            end: self.attr_buf.len() as u32,
+            input: false,
+        });
+        self.attrs.push(Attr { name, value });
     }
 
     fn emit_tag<S: Sink>(&mut self, sink: &mut S) {
         self.finish_attr();
+        let input = self.input;
+        let name = match self.name_input {
+            Some((s, e)) => &input[s..e],
+            None => self.tag_name.as_str(),
+        };
         let tag = Tag {
-            name: &self.tag_name,
+            name,
             self_closing: self.self_closing,
+            input,
             buf: &self.attr_buf,
             attrs: &self.attrs,
         };
@@ -340,10 +460,16 @@ impl<'a> Tokenizer<'a> {
             self.state = State::Data;
         } else {
             let mode = sink.start_tag(&tag);
-            self.last_start_tag.clear();
-            self.last_start_tag.push_str(&self.tag_name);
             self.state = State::Data;
+            // Only a tag that switches to a text mode is ever matched by
+            // an end tag there, so only that one is kept.
             if let Some(mode) = mode {
+                let name = match self.name_input {
+                    Some((s, e)) => &input[s..e],
+                    None => self.tag_name.as_str(),
+                };
+                self.last_start_tag.clear();
+                self.last_start_tag.push_str(name);
                 self.set_text_mode(mode);
             }
         }
@@ -641,6 +767,7 @@ impl<'a> Tokenizer<'a> {
                     }
                     Some(0) => {
                         self.pos += 1;
+                        self.flush_tag_name();
                         self.tag_name.push_str(REPLACEMENT);
                     }
                     Some(_) => {
@@ -648,7 +775,7 @@ impl<'a> Tokenizer<'a> {
                         let end = scan(bytes, start, |b| {
                             is_space(b) || matches!(b, b'/' | b'>' | 0)
                         });
-                        push_lower(&mut self.tag_name, &input[start..end]);
+                        self.push_tag_name(start, end);
                         self.pos = end;
                     }
                 },
@@ -832,6 +959,7 @@ impl<'a> Tokenizer<'a> {
                     }
                     Some(0) => {
                         self.pos += 1;
+                        self.flush_attr_name();
                         self.attr_buf.push_str(REPLACEMENT);
                     }
                     Some(_) => {
@@ -839,7 +967,7 @@ impl<'a> Tokenizer<'a> {
                         let end = scan(bytes, start, |b| {
                             is_space(b) || matches!(b, b'/' | b'>' | b'=' | 0)
                         });
-                        push_lower(&mut self.attr_buf, &input[start..end]);
+                        self.push_attr_name(start, end);
                         self.pos = end;
                     }
                 },
@@ -870,17 +998,22 @@ impl<'a> Tokenizer<'a> {
                     Some(b) if is_space(b) => self.pos += 1,
                     Some(b'"') => {
                         self.pos += 1;
+                        self.value_from = Some(self.pos);
                         self.state = State::AttributeValueDoubleQuoted;
                     }
                     Some(b'\'') => {
                         self.pos += 1;
+                        self.value_from = Some(self.pos);
                         self.state = State::AttributeValueSingleQuoted;
                     }
                     Some(b'>') => {
                         self.pos += 1;
                         self.emit_tag(sink);
                     }
-                    _ => self.state = State::AttributeValueUnquoted,
+                    _ => {
+                        self.value_from = Some(self.pos);
+                        self.state = State::AttributeValueUnquoted;
+                    }
                 },
                 State::AttributeValueDoubleQuoted | State::AttributeValueSingleQuoted => {
                     let quote = if self.state == State::AttributeValueDoubleQuoted {
@@ -893,12 +1026,27 @@ impl<'a> Tokenizer<'a> {
                         sink.eof();
                         return;
                     };
-                    self.attr_buf.push_str(&input[self.pos..self.pos + i]);
-                    self.pos += i + 1;
-                    match rest[i] {
-                        b'&' => self.char_ref(sink, true),
-                        0 => self.attr_buf.push_str(REPLACEMENT),
-                        _ => self.state = State::AfterAttributeValueQuoted,
+                    let at = self.pos + i;
+                    if rest[i] == quote {
+                        if self.value_from.is_some() {
+                            self.end_value(at);
+                        } else {
+                            self.attr_buf.push_str(&input[self.pos..at]);
+                        }
+                        self.pos = at + 1;
+                        self.state = State::AfterAttributeValueQuoted;
+                    } else {
+                        if self.value_from.is_some() {
+                            self.flush_value(at);
+                        } else {
+                            self.attr_buf.push_str(&input[self.pos..at]);
+                        }
+                        self.pos = at + 1;
+                        if rest[i] == b'&' {
+                            self.char_ref(sink, true);
+                        } else {
+                            self.attr_buf.push_str(REPLACEMENT);
+                        }
                     }
                 }
                 State::AttributeValueUnquoted => match self.byte() {
@@ -907,18 +1055,22 @@ impl<'a> Tokenizer<'a> {
                         return;
                     }
                     Some(b) if is_space(b) => {
+                        self.end_value(self.pos);
                         self.pos += 1;
                         self.state = State::BeforeAttributeName;
                     }
                     Some(b'&') => {
+                        self.flush_value(self.pos);
                         self.pos += 1;
                         self.char_ref(sink, true);
                     }
                     Some(b'>') => {
+                        self.end_value(self.pos);
                         self.pos += 1;
                         self.emit_tag(sink);
                     }
                     Some(0) => {
+                        self.flush_value(self.pos);
                         self.pos += 1;
                         self.attr_buf.push_str(REPLACEMENT);
                     }
@@ -927,7 +1079,9 @@ impl<'a> Tokenizer<'a> {
                         let end = scan(bytes, start, |b| {
                             is_space(b) || matches!(b, b'&' | b'>' | 0)
                         });
-                        self.attr_buf.push_str(&input[start..end]);
+                        if self.value_from.is_none() {
+                            self.attr_buf.push_str(&input[start..end]);
+                        }
                         self.pos = end;
                     }
                 },

@@ -873,10 +873,10 @@ impl TreeBuilder {
             Ns::Svg => match svg_tag_name(s.name) {
                 Some(fixed) => Name::Static(fixed),
                 None if s.tag != Tag::Other => Name::Tag,
-                None => Name::Span(self.doc.push_str(s.name)),
+                None => Name::Span(self.doc.intern(s.name)),
             },
             _ if s.tag != Tag::Other => Name::Tag,
-            _ => Name::Span(self.doc.push_str(s.name)),
+            _ => Name::Span(self.doc.intern(s.name)),
         };
         let first = self.doc.attrs.len() as u32;
         let mut html_integration = false;
@@ -900,8 +900,8 @@ impl TreeBuilder {
             {
                 html_integration = true;
             }
-            let name = self.doc.push_str(local);
-            let value = self.doc.push_str(v);
+            let name = self.doc.intern(local);
+            let value = self.doc.intern(v);
             self.doc.attrs.push(Attr {
                 ns: attr_ns,
                 name,
@@ -1182,7 +1182,7 @@ impl TreeBuilder {
         if prev != NONE && matches!(self.doc.nodes[prev as usize].data, Data::Text(_)) {
             self.doc.append_text(prev, text);
         } else {
-            let span = self.doc.push_str(text);
+            let span = self.doc.intern(text);
             let id = self.doc.add(Data::Text(span));
             self.doc.insert(parent, id, before);
         }
@@ -1190,15 +1190,15 @@ impl TreeBuilder {
 
     fn insert_comment(&mut self, text: &str, at: Option<(NodeId, NodeId)>) {
         let place = at.unwrap_or_else(|| self.place(None));
-        let span = self.doc.push_str(text);
+        let span = self.doc.intern(text);
         let id = self.doc.add(Data::Comment(span));
         self.doc.insert(place.0, id, place.1);
     }
 
     fn insert_pi(&mut self, target: &str, data: &str, at: Option<(NodeId, NodeId)>) {
         let place = at.unwrap_or_else(|| self.place(None));
-        let target = self.doc.push_str(target);
-        let data = self.doc.push_str(data);
+        let target = self.doc.intern(target);
+        let data = self.doc.intern(data);
         let id = self.doc.add(Data::ProcessingInstruction { target, data });
         self.doc.insert(place.0, id, place.1);
     }
@@ -1217,8 +1217,8 @@ impl TreeBuilder {
             if self.doc.attrs(id).any(|(_, name, _)| name == n) {
                 continue;
             }
-            let name = self.doc.push_str(n);
-            let value = self.doc.push_str(v);
+            let name = self.doc.intern(n);
+            let value = self.doc.intern(v);
             let attr = Attr {
                 ns: AttrNs::None,
                 name,
@@ -1327,9 +1327,9 @@ impl TreeBuilder {
             Tok::Comment(c) => self.insert_comment(c, Some((0, NONE))),
             Tok::Pi(target, data) => self.insert_pi(target, data, Some((0, NONE))),
             Tok::Doctype(d) => {
-                let name = self.doc.push_str(d.name.unwrap_or(""));
-                let public_id = self.doc.push_str(d.public_id.unwrap_or(""));
-                let system_id = self.doc.push_str(d.system_id.unwrap_or(""));
+                let name = self.doc.intern(d.name.unwrap_or(""));
+                let public_id = self.doc.intern(d.public_id.unwrap_or(""));
+                let system_id = self.doc.intern(d.system_id.unwrap_or(""));
                 let id = self.doc.add(Data::Doctype {
                     name,
                     public_id,
@@ -2737,23 +2737,37 @@ impl Sink for TreeBuilder {
 
 /// Parses a whole document.
 pub fn parse(html: &str, scripting: bool) -> Document {
-    let input = tokenizer::preprocess(html);
-    let mut builder = TreeBuilder::new(input.len(), scripting);
-    Tokenizer::new(&input).run(&mut builder);
+    let mut builder = TreeBuilder::new(html.len(), scripting);
+    let input = source(&mut builder, html);
+    Tokenizer::new(input).run(&mut builder);
     builder.doc
 }
 
 /// Parses `html` as the contents of an element named `context` in
 /// namespace `ns`, as `innerHTML` does.
 pub fn parse_fragment(html: &str, ns: Ns, context: &str, scripting: bool) -> Document {
-    let input = tokenizer::preprocess(html);
-    let mut builder = TreeBuilder::new(input.len(), scripting);
+    let mut builder = TreeBuilder::new(html.len(), scripting);
+    let input = source(&mut builder, html);
     let mode = builder.fragment(ns, context);
-    let mut tokenizer = Tokenizer::new(&input);
+    let mut tokenizer = Tokenizer::new(input);
     if let Some(mode) = mode {
         tokenizer.set_text_mode(mode);
     }
     tokenizer.run(&mut builder);
     builder.finish_fragment();
     builder.doc
+}
+
+/// Gives the document its preprocessed source, and returns it for the
+/// tokenizer to read.
+fn source<'a>(builder: &mut TreeBuilder, html: &str) -> &'a str {
+    builder.doc.src = match tokenizer::preprocess(html) {
+        std::borrow::Cow::Borrowed(s) => s.into(),
+        std::borrow::Cow::Owned(s) => s.into_boxed_str(),
+    };
+    // SAFETY: the source is a boxed str the document never changes or
+    // drops while it's parsed, so its bytes stay where they are while the
+    // tokenizer reads them, even though the builder holding them moves.
+    // The returned reference doesn't outlive the parse functions above.
+    unsafe { &*(builder.doc.src.as_ref() as *const str) }
 }
