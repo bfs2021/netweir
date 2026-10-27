@@ -48,8 +48,9 @@ pub(crate) struct Span {
 pub(crate) enum Name {
     /// The tag's own lowercase name.
     Tag,
-    /// A name the parser fixed the case of, such as SVG's `clipPath`.
-    Static(&'static str),
+    /// An SVG name the parser fixed the case of, such as `clipPath`: its
+    /// index in the table of them.
+    Svg(u8),
     /// Any other name, in the document's buffer.
     Span(Span),
 }
@@ -137,7 +138,7 @@ pub enum Kind<'a> {
 
 impl Document {
     pub(crate) fn new(root: Data, capacity: usize) -> Document {
-        let mut nodes = Vec::with_capacity(capacity / 32 + 16);
+        let mut nodes = Vec::with_capacity(capacity / 24 + 16);
         nodes.push(Node {
             parent: NONE,
             first_child: NONE,
@@ -150,7 +151,7 @@ impl Document {
             nodes,
             src: Box::default(),
             buf: String::with_capacity(capacity / 8),
-            attrs: Vec::with_capacity(capacity / 64 + 16),
+            attrs: Vec::with_capacity(capacity / 32 + 16),
             quirks: Quirks::No,
         }
     }
@@ -230,7 +231,7 @@ impl Document {
     pub(crate) fn element_name(&self, e: &Element) -> &str {
         match e.name {
             Name::Tag => e.tag.name(),
-            Name::Static(s) => s,
+            Name::Svg(i) => crate::tree::SVG_TAG_NAMES[i as usize].1,
             Name::Span(s) => self.str(s),
         }
     }

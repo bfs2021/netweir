@@ -273,48 +273,53 @@ fn mathml_text_integration(o: Open) -> bool {
     o.ns == Ns::MathMl && matches!(o.tag, Tag::Mi | Tag::Mo | Tag::Mn | Tag::Ms | Tag::Mtext)
 }
 
-/// SVG element names whose case the parser fixes.
-fn svg_tag_name(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "altglyph" => "altGlyph",
-        "altglyphdef" => "altGlyphDef",
-        "altglyphitem" => "altGlyphItem",
-        "animatecolor" => "animateColor",
-        "animatemotion" => "animateMotion",
-        "animatetransform" => "animateTransform",
-        "clippath" => "clipPath",
-        "feblend" => "feBlend",
-        "fecolormatrix" => "feColorMatrix",
-        "fecomponenttransfer" => "feComponentTransfer",
-        "fecomposite" => "feComposite",
-        "feconvolvematrix" => "feConvolveMatrix",
-        "fediffuselighting" => "feDiffuseLighting",
-        "fedisplacementmap" => "feDisplacementMap",
-        "fedistantlight" => "feDistantLight",
-        "fedropshadow" => "feDropShadow",
-        "feflood" => "feFlood",
-        "fefunca" => "feFuncA",
-        "fefuncb" => "feFuncB",
-        "fefuncg" => "feFuncG",
-        "fefuncr" => "feFuncR",
-        "fegaussianblur" => "feGaussianBlur",
-        "feimage" => "feImage",
-        "femerge" => "feMerge",
-        "femergenode" => "feMergeNode",
-        "femorphology" => "feMorphology",
-        "feoffset" => "feOffset",
-        "fepointlight" => "fePointLight",
-        "fespecularlighting" => "feSpecularLighting",
-        "fespotlight" => "feSpotLight",
-        "fetile" => "feTile",
-        "feturbulence" => "feTurbulence",
-        "foreignobject" => "foreignObject",
-        "glyphref" => "glyphRef",
-        "lineargradient" => "linearGradient",
-        "radialgradient" => "radialGradient",
-        "textpath" => "textPath",
-        _ => return None,
-    })
+/// SVG element names whose case the parser fixes: as tokenized, and as
+/// the element has it.
+pub(crate) static SVG_TAG_NAMES: [(&str, &str); 37] = [
+    ("altglyph", "altGlyph"),
+    ("altglyphdef", "altGlyphDef"),
+    ("altglyphitem", "altGlyphItem"),
+    ("animatecolor", "animateColor"),
+    ("animatemotion", "animateMotion"),
+    ("animatetransform", "animateTransform"),
+    ("clippath", "clipPath"),
+    ("feblend", "feBlend"),
+    ("fecolormatrix", "feColorMatrix"),
+    ("fecomponenttransfer", "feComponentTransfer"),
+    ("fecomposite", "feComposite"),
+    ("feconvolvematrix", "feConvolveMatrix"),
+    ("fediffuselighting", "feDiffuseLighting"),
+    ("fedisplacementmap", "feDisplacementMap"),
+    ("fedistantlight", "feDistantLight"),
+    ("fedropshadow", "feDropShadow"),
+    ("feflood", "feFlood"),
+    ("fefunca", "feFuncA"),
+    ("fefuncb", "feFuncB"),
+    ("fefuncg", "feFuncG"),
+    ("fefuncr", "feFuncR"),
+    ("fegaussianblur", "feGaussianBlur"),
+    ("feimage", "feImage"),
+    ("femerge", "feMerge"),
+    ("femergenode", "feMergeNode"),
+    ("femorphology", "feMorphology"),
+    ("feoffset", "feOffset"),
+    ("fepointlight", "fePointLight"),
+    ("fespecularlighting", "feSpecularLighting"),
+    ("fespotlight", "feSpotLight"),
+    ("fetile", "feTile"),
+    ("feturbulence", "feTurbulence"),
+    ("foreignobject", "foreignObject"),
+    ("glyphref", "glyphRef"),
+    ("lineargradient", "linearGradient"),
+    ("radialgradient", "radialGradient"),
+    ("textpath", "textPath"),
+];
+
+fn svg_tag_name(name: &str) -> Option<u8> {
+    SVG_TAG_NAMES
+        .iter()
+        .position(|(lower, _)| *lower == name)
+        .map(|i| i as u8)
 }
 
 /// SVG attribute names whose case the parser fixes.
@@ -907,7 +912,7 @@ impl TreeBuilder {
     fn create(&mut self, s: &Start<'_>, ns: Ns) -> NodeId {
         let name = match ns {
             Ns::Svg => match svg_tag_name(s.name) {
-                Some(fixed) => Name::Static(fixed),
+                Some(fixed) => Name::Svg(fixed),
                 None if s.tag != Tag::Other => Name::Tag,
                 None => Name::Span(self.doc.intern(s.name)),
             },

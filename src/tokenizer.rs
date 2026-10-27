@@ -249,6 +249,10 @@ pub struct Tokenizer<'a> {
     public_id: Option<String>,
     system_id: Option<String>,
     force_quirks: bool,
+
+    /// Whether plain tags take [`Tokenizer::fast_tag`]; off only in the
+    /// test that checks it against the state machine.
+    fast: bool,
 }
 
 const fn is_space(b: u8) -> bool {
@@ -282,6 +286,7 @@ impl<'a> Tokenizer<'a> {
             public_id: None,
             system_id: None,
             force_quirks: false,
+            fast: true,
         }
     }
 
@@ -473,6 +478,124 @@ impl<'a> Tokenizer<'a> {
                 self.set_text_mode(mode);
             }
         }
+    }
+
+    /// Reads a plain tag in one pass, from its name to its `>`: lowercase
+    /// names, and values with no character reference or NUL, which is
+    /// most tags on most pages. Anything else, it leaves for the state
+    /// machine, from the same place, and returns false. It takes the
+    /// same steps the states would, so a tag reads the same either way.
+    fn fast_tag<S: Sink>(&mut self, sink: &mut S) -> bool {
+        if !self.fast {
+            return false;
+        }
+        let bytes = self.input.as_bytes();
+        let len = bytes.len();
+        let mut p = self.pos;
+        let name_start = p;
+        while p < len && !TAG_NAME_END[bytes[p] as usize] {
+            if bytes[p].is_ascii_uppercase() {
+                return false;
+            }
+            p += 1;
+        }
+        let name = (name_start, p);
+        let mut self_closing = false;
+        loop {
+            while p < len && is_space(bytes[p]) {
+                p += 1;
+            }
+            match bytes.get(p) {
+                None => return self.bail(),
+                Some(b'>') => {
+                    p += 1;
+                    break;
+                }
+                Some(b'/') if bytes.get(p + 1) == Some(&b'>') => {
+                    self_closing = true;
+                    p += 2;
+                    break;
+                }
+                Some(b'/') => return self.bail(),
+                _ => {}
+            }
+            let a = p;
+            while p < len && !ATTR_NAME_END[bytes[p] as usize] {
+                let c = bytes[p];
+                if c.is_ascii_uppercase() || matches!(c, b'"' | b'\'' | b'<') {
+                    return self.bail();
+                }
+                p += 1;
+            }
+            if p == a || p >= len {
+                return self.bail();
+            }
+            let attr_name = (a, p);
+            let value = match bytes[p] {
+                b'=' => {
+                    p += 1;
+                    match bytes.get(p) {
+                        Some(&q @ (b'"' | b'\'')) => {
+                            p += 1;
+                            match memchr3(q, b'&', 0, &bytes[p..]) {
+                                Some(i) if bytes[p + i] == q => {
+                                    let v = (p, p + i);
+                                    p += i + 1;
+                                    v
+                                }
+                                _ => return self.bail(),
+                            }
+                        }
+                        Some(_) => {
+                            let v = p;
+                            while p < len && !UNQUOTED_END[bytes[p] as usize] {
+                                if matches!(bytes[p], b'"' | b'\'' | b'<' | b'=' | b'`') {
+                                    return self.bail();
+                                }
+                                p += 1;
+                            }
+                            if p >= len || matches!(bytes[p], b'&' | 0) || p == v {
+                                return self.bail();
+                            }
+                            (v, p)
+                        }
+                        None => return self.bail(),
+                    }
+                }
+                b if is_space(b) || b == b'>' || b == b'/' => (p, p),
+                _ => return self.bail(),
+            };
+            let this = &self.input[attr_name.0..attr_name.1];
+            let input = self.input;
+            if !self
+                .attrs
+                .iter()
+                .any(|x| x.name.get(input, &self.attr_buf) == this)
+            {
+                self.attrs.push(Attr {
+                    name: Text {
+                        start: attr_name.0 as u32,
+                        end: attr_name.1 as u32,
+                        input: true,
+                    },
+                    value: Text {
+                        start: value.0 as u32,
+                        end: value.1 as u32,
+                        input: true,
+                    },
+                });
+            }
+        }
+        self.name_input = Some(name);
+        self.self_closing = self_closing;
+        self.pos = p;
+        self.emit_tag(sink);
+        true
+    }
+
+    fn bail(&mut self) -> bool {
+        self.attrs.clear();
+        false
     }
 
     fn emit_comment<S: Sink>(&mut self, sink: &mut S) {
@@ -712,7 +835,9 @@ impl<'a> Tokenizer<'a> {
                     }
                     Some(b) if b.is_ascii_alphabetic() => {
                         self.new_tag(false);
-                        self.state = State::TagName;
+                        if !self.fast_tag(sink) {
+                            self.state = State::TagName;
+                        }
                     }
                     Some(b'?') => {
                         self.pos += 1;
@@ -732,7 +857,9 @@ impl<'a> Tokenizer<'a> {
                 State::EndTagOpen => match self.byte() {
                     Some(b) if b.is_ascii_alphabetic() => {
                         self.new_tag(true);
-                        self.state = State::TagName;
+                        if !self.fast_tag(sink) {
+                            self.state = State::TagName;
+                        }
                     }
                     Some(b'>') => {
                         self.pos += 1;
@@ -1611,6 +1738,25 @@ impl<'a> Tokenizer<'a> {
     }
 }
 
+/// A table of the bytes that end a run: whitespace and `extra`.
+const fn stops(extra: &[u8]) -> [bool; 256] {
+    let mut t = [false; 256];
+    t[b'\t' as usize] = true;
+    t[b'\n' as usize] = true;
+    t[0x0C] = true;
+    t[b' ' as usize] = true;
+    let mut i = 0;
+    while i < extra.len() {
+        t[extra[i] as usize] = true;
+        i += 1;
+    }
+    t
+}
+
+static TAG_NAME_END: [bool; 256] = stops(b"/>\0");
+static ATTR_NAME_END: [bool; 256] = stops(b"/>=\0");
+static UNQUOTED_END: [bool; 256] = stops(b"&>\0");
+
 /// The first index from `start` whose byte `stop` accepts, or the end.
 fn scan(bytes: &[u8], start: usize, stop: impl Fn(u8) -> bool) -> usize {
     bytes[start..]
@@ -1681,6 +1827,73 @@ mod tests {
             ENTITIES.iter().map(|(n, _)| n.len()).max(),
             Some(LONGEST_NAME)
         );
+    }
+
+    /// Every token, as text, for comparing two runs.
+    #[derive(Default)]
+    struct Record(Vec<String>);
+
+    impl Sink for Record {
+        fn doctype(&mut self, d: &Doctype<'_>) {
+            self.0.push(format!("{d:?}"));
+        }
+        fn start_tag(&mut self, t: &Tag<'_>) -> Option<TextMode> {
+            let attrs: Vec<_> = t.attrs().collect();
+            self.0
+                .push(format!("<{} {attrs:?} {}>", t.name, t.self_closing));
+            None
+        }
+        fn end_tag(&mut self, t: &Tag<'_>) {
+            self.0.push(format!("</{}>", t.name));
+        }
+        fn comment(&mut self, text: &str) {
+            self.0.push(format!("<!--{text}-->"));
+        }
+        fn processing_instruction(&mut self, target: &str, data: &str) {
+            self.0.push(format!("<?{target} {data}>"));
+        }
+        fn text(&mut self, text: &str) {
+            match self.0.last_mut() {
+                Some(last) if last.starts_with('"') => last.push_str(text),
+                _ => self.0.push(format!("\"{text}")),
+            }
+        }
+        fn eof(&mut self) {
+            self.0.push("EOF".into());
+        }
+    }
+
+    fn tokens(input: &str, fast: bool) -> Vec<String> {
+        let mut t = Tokenizer::new(input);
+        t.fast = fast;
+        let mut r = Record::default();
+        t.run(&mut r);
+        r.0
+    }
+
+    /// Random tag soup, built from the pieces the fast path decides on,
+    /// tokenizes the same with and without it.
+    #[test]
+    fn the_fast_path_reads_tags_as_the_states_do() {
+        const PIECES: &[&str] = &[
+            "<", ">", "/", "/>", "</", "a", "B", "div", " ", "\t", "\n", "=", "\"", "'", "&",
+            "&amp;", "&#65;", "x", "-", "\0", "`", "<p", "<a ", "href", "id", "=x", "=\"v\"",
+            "='v'", "é", "!", "?", ">text<",
+        ];
+        let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..20_000 {
+            let n = (next() % 24) as usize;
+            let input: String = (0..n)
+                .map(|_| PIECES[(next() % PIECES.len() as u64) as usize])
+                .collect();
+            assert_eq!(tokens(&input, true), tokens(&input, false), "{input:?}");
+        }
     }
 
     #[test]
