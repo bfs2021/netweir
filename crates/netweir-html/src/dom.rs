@@ -38,6 +38,13 @@ pub enum Quirks {
 /// in the buffer of strings the parser had to make.
 const IN_SOURCE: u32 = 1 << 31;
 
+/// A span with this bit (and not IN_SOURCE) is a string an edit added:
+/// `start` is its index in `extras`.
+const IN_EXTRA: u32 = 1 << 30;
+
+/// The most input a document can hold: spans keep offsets in 30 bits.
+pub const MAX_INPUT: usize = 1 << 30;
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Span {
     pub start: u32,
@@ -110,6 +117,9 @@ pub struct Document {
     /// didn't need changing point into it rather than being copied.
     pub(crate) src: Box<str>,
     pub(crate) buf: String,
+    /// Strings edits add, each in an allocation of its own: an edit never
+    /// moves a string already handed out, as growing `buf` would.
+    pub(crate) extras: Vec<Box<str>>,
     pub(crate) attrs: Vec<Attr>,
     pub(crate) quirks: Quirks,
     /// Whether it was parsed with scripting on, which decides how a
@@ -154,6 +164,7 @@ impl Document {
             nodes,
             src: Box::default(),
             buf: String::with_capacity(capacity / 8),
+            extras: Vec::new(),
             attrs: Vec::with_capacity(capacity / 32 + 16),
             quirks: Quirks::No,
             scripting: false,
@@ -179,9 +190,19 @@ impl Document {
     pub(crate) fn str(&self, s: Span) -> &str {
         if s.start & IN_SOURCE != 0 {
             &self.src[(s.start & !IN_SOURCE) as usize..(s.end & !IN_SOURCE) as usize]
+        } else if s.start & IN_EXTRA != 0 {
+            &self.extras[(s.start & !IN_EXTRA) as usize]
         } else {
             &self.buf[s.start as usize..s.end as usize]
         }
+    }
+
+    /// A span for a string an edit adds. Unlike the parser's strings, it
+    /// never moves, so a `&str` read before the edit stays good.
+    pub(crate) fn push_stable(&mut self, s: &str) -> Span {
+        let at = self.extras.len() as u32 | IN_EXTRA;
+        self.extras.push(s.into());
+        Span { start: at, end: at }
     }
 
     /// Where `s` is in the source, if it's a slice of it.
@@ -291,11 +312,13 @@ impl Document {
 
     /// Appends text to a text node, copying its old text to the end of the
     /// buffer first if something else has been written after it.
+    /// Only the parser calls this: it may move the buffer.
     pub(crate) fn append_text(&mut self, id: NodeId, text: &str) {
         let Data::Text(span) = self.nodes[id as usize].data else {
             unreachable!("not a text node")
         };
         let in_source = span.start & IN_SOURCE != 0;
+        let in_buf = span.start & (IN_SOURCE | IN_EXTRA) == 0;
         let span =
             if in_source && self.source_offset(text) == Some((span.end & !IN_SOURCE) as usize) {
                 // The next slice of the source: the span just grows.
@@ -303,21 +326,16 @@ impl Document {
                     start: span.start,
                     end: span.end + text.len() as u32,
                 }
-            } else if !in_source && span.end as usize == self.buf.len() {
+            } else if in_buf && span.end as usize == self.buf.len() {
                 self.buf.push_str(text);
                 Span {
                     start: span.start,
                     end: self.buf.len() as u32,
                 }
             } else {
+                let old = self.str(span).to_owned();
                 let start = self.buf.len();
-                if in_source {
-                    let old = (span.start & !IN_SOURCE) as usize..(span.end & !IN_SOURCE) as usize;
-                    self.buf.push_str(&self.src[old]);
-                } else {
-                    self.buf
-                        .extend_from_within(span.start as usize..span.end as usize);
-                }
+                self.buf.push_str(&old);
                 self.buf.push_str(text);
                 Span {
                     start: start as u32,

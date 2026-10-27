@@ -10,6 +10,6 @@ mod tags;
 pub mod tokenizer;
 mod tree;
 
-pub use dom::{AttrNs, Document, Kind, NodeId, Ns, Quirks};
+pub use dom::{AttrNs, Document, Kind, MAX_INPUT, NodeId, Ns, Quirks};
 pub use edit::EditError;
 pub use tree::{parse, parse_fragment};

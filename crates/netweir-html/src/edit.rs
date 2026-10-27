@@ -38,7 +38,7 @@ impl Document {
             Ns::Html => {
                 let tag = Tag::from_name(&lower);
                 let name = if tag == Tag::Other {
-                    Name::Span(self.push_str(&lower))
+                    Name::Span(self.push_stable(&lower))
                 } else {
                     Name::Tag
                 };
@@ -49,7 +49,7 @@ impl Document {
                 let name = if tag != Tag::Other && tag.name() == name {
                     Name::Tag
                 } else {
-                    Name::Span(self.push_str(name))
+                    Name::Span(self.push_stable(name))
                 };
                 (tag, name)
             }
@@ -71,18 +71,18 @@ impl Document {
     }
 
     pub fn create_text(&mut self, text: &str) -> NodeId {
-        let span = self.push_str(text);
+        let span = self.push_stable(text);
         self.add(Data::Text(span))
     }
 
     pub fn create_comment(&mut self, text: &str) -> NodeId {
-        let span = self.push_str(text);
+        let span = self.push_stable(text);
         self.add(Data::Comment(span))
     }
 
     pub fn create_processing_instruction(&mut self, target: &str, data: &str) -> NodeId {
-        let target = self.push_str(target);
-        let data = self.push_str(data);
+        let target = self.push_stable(target);
+        let data = self.push_stable(data);
         self.add(Data::ProcessingInstruction { target, data })
     }
 
@@ -157,8 +157,8 @@ impl Document {
         } else {
             name.to_string()
         };
-        let value = self.push_str(value);
-        let name_span = self.push_str(&name);
+        let value = self.push_stable(value);
+        let name_span = self.push_stable(&name);
         self.rewrite_attrs(id, |doc, attrs| {
             match attrs
                 .iter_mut()
@@ -253,6 +253,33 @@ mod tests {
         assert_eq!(doc.outer_html(b), "<b>x</b>");
         // Written the same before and after.
         assert_eq!(doc.inner_html(0), "<template><b>x</b></template>");
+    }
+
+    /// Netweir reads strings through a shared borrow while an edit may
+    /// run under its own lock, so a string an edit didn't touch must stay
+    /// exactly where it was.
+    #[test]
+    fn edits_never_move_strings_already_read() {
+        // Values with references: the parser copies those into its buffer,
+        // the one place that could move.
+        let mut doc = parse_fragment("<a href='x&amp;y'>t&amp;u</a>", Ns::Html, "div", false);
+        let a = doc.first_child(0).unwrap();
+        let text = doc.first_child(a).unwrap();
+        let href = doc.attrs(a).next().unwrap().2.as_ptr();
+        let data = match doc.kind(text) {
+            crate::Kind::Text(t) => t.as_ptr(),
+            _ => unreachable!(),
+        };
+        for i in 0..10_000 {
+            let n = doc.create_element(Ns::Html, &format!("custom-{i}"));
+            doc.set_attr(n, "data-long", &"y".repeat(100));
+            let t = doc.create_text(&"z".repeat(100));
+            doc.append(n, t).unwrap();
+            doc.append(0, n).unwrap();
+        }
+        doc.set_attr(a, "title", "new");
+        assert_eq!(doc.attrs(a).next().unwrap().2.as_ptr(), href);
+        assert!(matches!(doc.kind(text), crate::Kind::Text(t) if t.as_ptr() == data));
     }
 
     #[test]
