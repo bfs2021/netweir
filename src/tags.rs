@@ -11,11 +11,30 @@ macro_rules! tags {
             Other,
         }
 
+        /// Every known tag, in declaration order, so `ALL[t as usize]`
+        /// is `t`.
+        const ALL: &[(&str, Tag)] = &[$(($name, Tag::$tag),)*];
+
         impl Tag {
+            /// The tag for a lowercased name. Called for every tag in a
+            /// page, so it's a hash table rather than a string match.
             pub fn from_name(name: &str) -> Tag {
-                match name {
-                    $($name => Tag::$tag,)*
-                    _ => Tag::Other,
+                let b = name.as_bytes();
+                if b.is_empty() || b.len() > LONGEST {
+                    return Tag::Other;
+                }
+                let table = TABLE.get_or_init(build);
+                let mut slot = hash(b);
+                loop {
+                    let entry = table[slot];
+                    if entry == 0 {
+                        return Tag::Other;
+                    }
+                    let (n, tag) = ALL[entry as usize - 1];
+                    if n.as_bytes() == b {
+                        return tag;
+                    }
+                    slot = (slot + 1) & (SLOTS - 1);
                 }
             }
 
@@ -28,6 +47,35 @@ macro_rules! tags {
             }
         }
     };
+}
+
+const SLOTS: usize = 1024;
+
+/// The longest known tag name, "selectedcontent".
+const LONGEST: usize = 15;
+
+static TABLE: std::sync::OnceLock<[u8; SLOTS]> = std::sync::OnceLock::new();
+
+fn hash(b: &[u8]) -> usize {
+    let n = b.len();
+    let h = (n as u32).wrapping_mul(0x9E37_79B9)
+        ^ (b[0] as u32).wrapping_mul(0x85EB_CA6B)
+        ^ (b[n - 1] as u32).wrapping_mul(0xC2B2_AE35)
+        ^ (b[n / 2] as u32).wrapping_mul(0x27D4_EB2F);
+    (h ^ (h >> 15)) as usize & (SLOTS - 1)
+}
+
+/// Open addressing: each slot holds a tag's index in `ALL`, plus one.
+fn build() -> [u8; SLOTS] {
+    let mut table = [0u8; SLOTS];
+    for (i, (name, _)) in ALL.iter().enumerate() {
+        let mut slot = hash(name.as_bytes());
+        while table[slot] != 0 {
+            slot = (slot + 1) & (SLOTS - 1);
+        }
+        table[slot] = (i + 1) as u8;
+    }
+    table
 }
 
 tags! {
@@ -167,5 +215,15 @@ mod tests {
             assert_eq!(Tag::from_name(name).name(), name);
         }
         assert_eq!(Tag::from_name("blink"), Tag::Other);
+        assert_eq!(Tag::from_name(""), Tag::Other);
+        assert_eq!(Tag::from_name("selectedcontentx"), Tag::Other);
+    }
+
+    #[test]
+    fn every_tag_is_found_by_its_name() {
+        for &(name, tag) in ALL {
+            assert_eq!(Tag::from_name(name), tag, "{name}");
+            assert!(name.len() <= LONGEST, "{name}");
+        }
     }
 }

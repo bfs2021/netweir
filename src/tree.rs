@@ -123,6 +123,9 @@ pub(crate) struct TreeBuilder {
     /// `<selectedcontent>`.
     selected: HashMap<NodeId, NodeId>,
     option_select: HashMap<NodeId, NodeId>,
+    /// How many HTML elements of each tag are open, so "is there a p in
+    /// button scope" is answered without walking the stack when none is.
+    counts: [u32; 256],
 }
 
 fn is_space(c: u8) -> bool {
@@ -519,6 +522,7 @@ impl TreeBuilder {
             done: false,
             selected: HashMap::new(),
             option_select: HashMap::new(),
+            counts: [0; 256],
         }
     }
 
@@ -542,7 +546,7 @@ impl TreeBuilder {
         });
         let root = self.create(&Start::bare(Tag::Html), Ns::Html);
         self.doc.insert(0, root, NONE);
-        self.open.push(Open {
+        self.push_open(Open {
             id: root,
             ns: Ns::Html,
             tag: Tag::Html,
@@ -597,8 +601,37 @@ impl TreeBuilder {
         }
     }
 
+    fn push_open(&mut self, o: Open) {
+        if o.ns == Ns::Html {
+            self.counts[o.tag as usize] += 1;
+        }
+        self.open.push(o);
+    }
+
+    fn remove_open_at(&mut self, i: usize) -> Open {
+        let o = self.open.remove(i);
+        if o.ns == Ns::Html {
+            self.counts[o.tag as usize] -= 1;
+        }
+        o
+    }
+
+    fn insert_open_at(&mut self, i: usize, o: Open) {
+        if o.ns == Ns::Html {
+            self.counts[o.tag as usize] += 1;
+        }
+        self.open.insert(i, o);
+    }
+
+    fn open_count(&self, tag: Tag) -> u32 {
+        self.counts[tag as usize]
+    }
+
     fn pop(&mut self) -> Option<Open> {
         let o = self.open.pop()?;
+        if o.ns == Ns::Html {
+            self.counts[o.tag as usize] -= 1;
+        }
         if o.is(Tag::Option) {
             self.option_popped(o.id);
         }
@@ -612,7 +645,7 @@ impl TreeBuilder {
     }
 
     fn template_open(&self) -> bool {
-        self.open.iter().any(|o| o.is(Tag::Template))
+        self.open_count(Tag::Template) > 0
     }
 
     /// The spec's "parsing template contents", which the form element
@@ -622,6 +655,9 @@ impl TreeBuilder {
     }
 
     fn in_scope(&self, tag: Tag, scope: Scope) -> bool {
+        if tag != Tag::Other && self.open_count(tag) == 0 {
+            return false;
+        }
         for &o in self.open.iter().rev() {
             if o.is(tag) {
                 return true;
@@ -675,7 +711,7 @@ impl TreeBuilder {
 
     fn remove_open(&mut self, id: NodeId) {
         if let Some(i) = self.open.iter().rposition(|o| o.id == id) {
-            self.open.remove(i);
+            self.remove_open_at(i);
         }
     }
 
@@ -853,7 +889,7 @@ impl TreeBuilder {
             self.insert_at(place, new);
             let e = self.doc.element(new).unwrap();
             let (ns, tag) = (e.ns, e.tag);
-            self.open.push(Open { id: new, ns, tag });
+            self.push_open(Open { id: new, ns, tag });
             self.active[j] = new;
         }
     }
@@ -988,7 +1024,7 @@ impl TreeBuilder {
         let id = self.create(s, ns);
         let place = self.place(None);
         self.insert_at(place, id);
-        self.open.push(Open { id, ns, tag: s.tag });
+        self.push_open(Open { id, ns, tag: s.tag });
         if ns == Ns::Html {
             match s.tag {
                 Tag::Option => self.option_inserted(id, s),
@@ -1360,7 +1396,7 @@ impl TreeBuilder {
             Tok::Start(s) if s.tag == Tag::Html => {
                 let id = self.create(&s, Ns::Html);
                 self.insert_at((0, NONE), id);
-                self.open.push(Open {
+                self.push_open(Open {
                     id,
                     ns: Ns::Html,
                     tag: Tag::Html,
@@ -1375,7 +1411,7 @@ impl TreeBuilder {
     fn before_html_else(&mut self, t: Tok<'_>) {
         let id = self.create(&Start::bare(Tag::Html), Ns::Html);
         self.insert_at((0, NONE), id);
-        self.open.push(Open {
+        self.push_open(Open {
             id,
             ns: Ns::Html,
             tag: Tag::Html,
@@ -1533,7 +1569,7 @@ impl TreeBuilder {
                 Base | Basefont | Bgsound | Link | Meta | Noframes | Script | Style | Template
                 | Title => {
                     let head = self.head;
-                    self.open.push(Open {
+                    self.push_open(Open {
                         id: head,
                         ns: Ns::Html,
                         tag: Head,
@@ -1560,15 +1596,16 @@ impl TreeBuilder {
     }
 
     fn body_text(&mut self, s: &str) {
-        for piece in s.split('\0') {
-            if piece.is_empty() {
-                continue;
-            }
+        if memchr::memchr(0, s.as_bytes()).is_none() {
             self.reconstruct();
-            self.insert_text(piece);
-            if !all_space(piece) {
+            self.insert_text(s);
+            if self.frameset_ok && !all_space(s) {
                 self.frameset_ok = false;
             }
+            return;
+        }
+        for piece in s.split('\0').filter(|p| !p.is_empty()) {
+            self.body_text(piece);
         }
     }
 
@@ -2015,7 +2052,7 @@ impl TreeBuilder {
                     in_active = None;
                 }
                 let Some(ai) = in_active else {
-                    self.open.remove(node_index);
+                    self.remove_open_at(node_index);
                     continue;
                 };
                 let new = self.clone_element(node.id);
@@ -2053,13 +2090,13 @@ impl TreeBuilder {
                 .iter()
                 .position(|o| o.id == fe)
                 .expect("still open");
-            let fe_entry = self.open.remove(fe_open);
+            let fe_entry = self.remove_open_at(fe_open);
             let fb = self
                 .open
                 .iter()
                 .position(|o| o.id == furthest)
                 .expect("still open");
-            self.open.insert(
+            self.insert_open_at(
                 fb + 1,
                 Open {
                     id: new,
