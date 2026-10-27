@@ -126,6 +126,9 @@ pub(crate) struct TreeBuilder {
     /// How many HTML elements of each tag are open, so "is there a p in
     /// button scope" is answered without walking the stack when none is.
     counts: [u32; 256],
+    /// Whether each node is on the stack of open elements, so asking is
+    /// one lookup however deep the stack is.
+    on_stack: Vec<bool>,
 }
 
 fn is_space(c: u8) -> bool {
@@ -528,6 +531,7 @@ impl TreeBuilder {
             selected: HashMap::new(),
             option_select: HashMap::new(),
             counts: [0; 256],
+            on_stack: vec![false; capacity / 24 + 1024],
         }
     }
 
@@ -606,7 +610,18 @@ impl TreeBuilder {
         }
     }
 
+    fn mark(&mut self, id: NodeId, on: bool) {
+        let i = id as usize;
+        if let Some(flag) = self.on_stack.get_mut(i) {
+            *flag = on;
+        } else {
+            self.on_stack.resize(i * 2 + 1024, false);
+            self.on_stack[i] = on;
+        }
+    }
+
     fn push_open(&mut self, o: Open) {
+        self.mark(o.id, true);
         if o.ns == Ns::Html {
             self.counts[o.tag as usize] += 1;
         }
@@ -615,6 +630,7 @@ impl TreeBuilder {
 
     fn remove_open_at(&mut self, i: usize) -> Open {
         let o = self.open.remove(i);
+        self.mark(o.id, false);
         if o.ns == Ns::Html {
             self.counts[o.tag as usize] -= 1;
         }
@@ -622,6 +638,7 @@ impl TreeBuilder {
     }
 
     fn insert_open_at(&mut self, i: usize, o: Open) {
+        self.mark(o.id, true);
         if o.ns == Ns::Html {
             self.counts[o.tag as usize] += 1;
         }
@@ -634,6 +651,7 @@ impl TreeBuilder {
 
     fn pop(&mut self) -> Option<Open> {
         let o = self.open.pop()?;
+        self.mark(o.id, false);
         if o.ns == Ns::Html {
             self.counts[o.tag as usize] -= 1;
         }
@@ -824,7 +842,7 @@ impl TreeBuilder {
     }
 
     fn open_contains(&self, id: NodeId) -> bool {
-        self.open.iter().any(|o| o.id == id)
+        self.on_stack.get(id as usize).copied().unwrap_or(false)
     }
 
     fn same_element(&self, a: NodeId, b: NodeId) -> bool {
@@ -2063,6 +2081,8 @@ impl TreeBuilder {
                 let new = self.clone_element(node.id);
                 self.active[ai] = new;
                 self.open[node_index] = Open { id: new, ..node };
+                self.mark(node.id, false);
+                self.mark(new, true);
                 if !bookmark_moved {
                     bookmark = ai + 1;
                     bookmark_moved = true;
