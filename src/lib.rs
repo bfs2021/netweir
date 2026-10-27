@@ -2,6 +2,7 @@
 //! Netweir and for speed.
 
 mod dom;
+mod edit;
 mod entities;
 mod serialize;
 mod tags;
@@ -9,4 +10,5 @@ pub mod tokenizer;
 mod tree;
 
 pub use dom::{AttrNs, Document, Kind, NodeId, Ns, Quirks};
+pub use edit::EditError;
 pub use tree::{parse, parse_fragment};
