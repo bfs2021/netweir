@@ -1,12 +1,11 @@
-use std::cell::RefCell;
 use std::collections::HashSet;
-use std::ffi::c_void;
 use std::fmt;
 use std::sync::Arc;
 
+use netweir_html::css::SelectorList;
+
 use crate::cache::{self, Cache};
 use crate::document::{Node, NodeId, NodeKind};
-use crate::ffi::{self, RawCssMemory, RawNode, RawSelectorList};
 
 /// What a query returns for each matched element.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,7 +33,8 @@ impl fmt::Display for QueryError {
 
 impl std::error::Error for QueryError {}
 
-/// lexbor couldn't allocate what a query needed to run.
+/// What a query needed to run couldn't be allocated. Kept for callers
+/// that handle it; the engine no longer reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutOfMemory;
 
@@ -74,28 +74,14 @@ impl Hit<'_> {
 /// Compile once, run on many documents, from any number of threads.
 pub struct Query {
     parts: Vec<Part>,
-    /// lexbor memory holding every part's selector list, made when the
-    /// first one is compiled (null until then). One per query rather than
-    /// one per comma-separated part, so a long selector list stays small.
-    memory: *mut RawCssMemory,
 }
 
 struct Part {
-    /// Null for an ending with no selector (`::text`), which matches the
-    /// scope. Otherwise it lives in the query's `memory`.
-    list: *mut RawSelectorList,
+    /// None for an ending with no selector (`::text`), which matches the
+    /// scope.
+    list: Option<SelectorList>,
     output: Output,
 }
-
-// SAFETY: the query's memory, holding every selector list, is a
-// self-contained allocation with no thread-local state, so moving it to another thread is fine. Sharing is
-// fine too: matching uses the calling thread's own lxb_selectors_t (one per
-// thread, cleaned after each match; see `Matcher`) and takes the list as
-// `const lxb_css_selector_list_t *`; lexbor's matcher
-// (selectors/selectors.c, 3.0.0) writes only to that matcher's state and
-// never to the list. The list is freed only in Drop, which needs ownership.
-unsafe impl Send for Query {}
-unsafe impl Sync for Query {}
 
 impl Query {
     pub fn new(css: &str) -> Result<Query, QueryError> {
@@ -103,33 +89,16 @@ impl Query {
             query: css.to_string(),
             reason,
         };
-        // Owned by a Query from the start, so a later part failing to
-        // compile frees the parts compiled before it.
-        let mut query = Query {
-            parts: Vec::new(),
-            memory: std::ptr::null_mut(),
-        };
+        let mut query = Query { parts: Vec::new() };
         for piece in split_top_level(css) {
             let (selector, output) = split_output(piece).ok_or_else(|| error("bad ::attr()"))?;
             let list = if selector.trim().is_empty() {
                 if output == Output::Nodes {
                     return Err(error("empty selector"));
                 }
-                std::ptr::null_mut()
+                None
             } else {
-                if query.memory.is_null() {
-                    query.memory = unsafe { ffi::nw_css_memory_new() };
-                    if query.memory.is_null() {
-                        return Err(error("out of memory"));
-                    }
-                }
-                let list = unsafe {
-                    ffi::nw_css_compile(query.memory, selector.as_ptr().cast(), selector.len())
-                };
-                if list.is_null() {
-                    return Err(error("not valid CSS"));
-                }
-                list
+                Some(SelectorList::parse(selector).map_err(|_| error("not valid CSS"))?)
             };
             query.parts.push(Part { list, output });
         }
@@ -154,7 +123,6 @@ impl Query {
     pub fn select<'a>(&self, scope: Node<'a>) -> Vec<Node<'a>> {
         let mut all: Vec<Node<'a>> = Vec::new();
         for part in &self.parts {
-            // Out of memory, a part finds nothing.
             all.extend(part.select(scope).unwrap_or_default());
         }
         if self.parts.len() > 1 {
@@ -163,13 +131,12 @@ impl Query {
         all
     }
 
-    /// The query's results, in document order. Nothing if lexbor runs out
-    /// of memory; [`Query::try_run`] says so instead.
+    /// The query's results, in document order.
     pub fn run<'a>(&self, scope: Node<'a>) -> Vec<Hit<'a>> {
         self.try_run(scope).unwrap_or_default()
     }
 
-    /// `run`, failing if lexbor can't allocate a matcher.
+    /// `run`, as a Result for callers written when matching could fail.
     pub fn try_run<'a>(&self, scope: Node<'a>) -> Result<Vec<Hit<'a>>, OutOfMemory> {
         if let [part] = self.parts.as_slice() {
             return part.run(scope);
@@ -200,48 +167,14 @@ fn sort_and_dedup<T: PartialEq>(items: &mut Vec<T>, key: impl Fn(&T) -> u32) {
 
 impl Part {
     fn select<'a>(&self, scope: Node<'a>) -> Result<Vec<Node<'a>>, OutOfMemory> {
-        if self.list.is_null() {
+        let Some(list) = &self.list else {
             return Ok(vec![scope]);
-        }
-        extern "C" fn found(node: *mut RawNode, ctx: *mut c_void) {
-            unsafe { (*ctx.cast::<Vec<*mut RawNode>>()).push(node) }
-        }
-        let mut raw: Vec<*mut RawNode> = Vec::new();
-        // Threads may match on one document at once: lexbor's matcher
-        // keeps all its state in the lxb_selectors_t (this thread's own),
-        // and only reads the tree, the selector list and the document's
-        // name tables.
-        {
-            let mut run = |m: &Matcher| {
-                // Only fails when lexbor cannot allocate; return what was found.
-                unsafe {
-                    ffi::nw_select(
-                        m.0,
-                        scope.raw,
-                        self.list,
-                        found,
-                        (&mut raw as *mut Vec<_>).cast(),
-                    )
-                };
-            };
-            // No kept matcher while this thread is exiting; make one.
-            let kept = MATCHER.try_with(|m| {
-                let mut m = m.borrow_mut();
-                // Made on first use, and again after a failed allocation.
-                if m.is_none() {
-                    *m = Matcher::new();
-                }
-                m.as_ref().map(&mut run)
-            });
-            match kept {
-                Ok(Some(())) => {}
-                Ok(None) => return Err(OutOfMemory),
-                Err(_) => run(&Matcher::new().ok_or(OutOfMemory)?),
-            }
-        }
-        Ok(raw
+        };
+        let doc = scope.doc;
+        Ok(list
+            .select(doc.tree(), scope.id)
             .into_iter()
-            .filter_map(|r| Node::wrap(scope.doc, r))
+            .map(|id| Node::from_raw(doc, id))
             .collect())
     }
 
@@ -254,7 +187,7 @@ impl Part {
     }
 
     /// The hits, with their positions in document order if `keyed` (a key
-    /// costs a call into lexbor and, on first use, the document index). An
+    /// costs, on first use, the document index). An
     /// attribute value sorts just after its element and before the
     /// element's children (whose order is higher), in source order, as XPath
     /// orders attributes.
@@ -298,36 +231,6 @@ impl Part {
             }
         }
         Ok(out)
-    }
-}
-
-/// A lexbor matcher. One per thread is kept, since making one costs more
-/// than matching inside a small element. Nothing in a match calls back into
-/// `select`, so a thread never uses its matcher twice at once.
-struct Matcher(*mut ffi::RawMatcher);
-
-impl Matcher {
-    /// None if lexbor can't allocate one.
-    fn new() -> Option<Matcher> {
-        let raw = unsafe { ffi::nw_matcher_new() };
-        (!raw.is_null()).then_some(Matcher(raw))
-    }
-}
-
-impl Drop for Matcher {
-    fn drop(&mut self) {
-        unsafe { ffi::nw_matcher_free(self.0) }
-    }
-}
-
-thread_local!(static MATCHER: RefCell<Option<Matcher>> = const { RefCell::new(None) });
-
-impl Drop for Query {
-    fn drop(&mut self) {
-        // Frees every part's list at once; nothing reads them after this.
-        if !self.memory.is_null() {
-            unsafe { ffi::nw_css_memory_free(self.memory) }
-        }
     }
 }
 

@@ -227,7 +227,7 @@ Like `check`, it turns off what would leave a trace (`checkpoint`,
 ### version [-v]
 
 `Netweir 0.3.1`. With `-v`, one line each for Netweir, Python, the platform,
-the Rust compiler that built the extension, lexbor's version, and the
+the Rust compiler that built the extension, the HTML parser's version, and the
 browser profiles built in with the short name each answers to. All of it is
 known at build time, so it costs nothing to print; the Chrome a crawl might
 drive isn't launched to ask its version.

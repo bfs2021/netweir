@@ -372,6 +372,10 @@ impl Document {
         Some(self.nodes[id as usize].prev).filter(|&c| c != NONE)
     }
 
+    pub fn last_child(&self, id: NodeId) -> Option<NodeId> {
+        Some(self.nodes[id as usize].last_child).filter(|&c| c != NONE)
+    }
+
     pub fn next_sibling(&self, id: NodeId) -> Option<NodeId> {
         Some(self.nodes[id as usize].next).filter(|&c| c != NONE)
     }

@@ -428,12 +428,12 @@ fn _robots_sitemaps(body: &str) -> Vec<String> {
 }
 
 /// What `netweir version -v` prints that only the build knows: the Rust
-/// compiler, lexbor's version and the built-in profiles.
+/// compiler, the HTML parser's version and the built-in profiles.
 #[pyfunction]
 fn _build_info(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyDict>> {
     let info = pyo3::types::PyDict::new(py);
     info.set_item("rustc", env!("NETWEIR_RUSTC"))?;
-    info.set_item("lexbor", netweir_dom::LEXBOR_VERSION)?;
+    info.set_item("parser", netweir_dom::PARSER)?;
     info.set_item("profiles", netweir_core::built_in_profiles())?;
     Ok(info)
 }

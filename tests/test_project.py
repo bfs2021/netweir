@@ -752,6 +752,6 @@ def test_version(capsys):
     assert capsys.readouterr().out == f"Netweir {netweir.__version__}\n"
     assert _cli.main(["version", "-v"]) == 0
     out = capsys.readouterr().out
-    for name in ("Netweir", "Python", "Platform", "Rust", "lexbor", "Profiles"):
+    for name in ("Netweir", "Python", "Platform", "Rust", "Parser", "Profiles"):
         assert name in out
     assert "chrome-" in out and "rustc " in out

@@ -188,10 +188,39 @@ impl Document {
     pub fn add_attr(&mut self, id: NodeId, ns: AttrNs, name: &str, value: &str) {
         let name = self.push_stable(name);
         let value = self.push_stable(value);
+        let attr = Attr { ns, name, value };
+        let len = self.attrs.len() as u32;
+        // An element whose attributes are the last in the list, as while
+        // it's being built, grows in place: a clone sharing the range keeps
+        // its own end, so it's unchanged. Anything else goes through a copy.
+        if let Data::Element(e) = &mut self.nodes[id as usize].data
+            && e.attrs.end == len
+        {
+            e.attrs.end += 1;
+            self.attrs.push(attr);
+            return;
+        }
         self.rewrite_attrs(id, |_, attrs| {
-            attrs.push(Attr { ns, name, value });
+            attrs.push(attr);
             true
         });
+    }
+
+    /// Replaces all of the element's attributes at once.
+    pub fn set_attrs(&mut self, id: NodeId, attrs: &[(AttrNs, &str, &str)]) {
+        if self.element(id).is_none() {
+            return;
+        }
+        let start = self.attrs.len() as u32;
+        for &(ns, name, value) in attrs {
+            let name = self.push_stable(name);
+            let value = self.push_stable(value);
+            self.attrs.push(Attr { ns, name, value });
+        }
+        let end = self.attrs.len() as u32;
+        if let Data::Element(e) = &mut self.nodes[id as usize].data {
+            e.attrs = Span { start, end };
+        }
     }
 
     /// Renames the element: lowercased for HTML, as given for the rest.

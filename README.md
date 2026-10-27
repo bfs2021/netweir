@@ -483,10 +483,12 @@ still a page; check `page.status`.
 
 ## Why it's fast
 
-Pages are parsed by [lexbor](https://github.com/lexbor/lexbor), the same
-spec-compliant C parser selectolax uses. The difference is what happens
-after: Netweir runs the whole query in Rust and hands Python a finished list
-of strings, instead of a Python object for every element along the way. The
+Netweir parses with its own HTML parser, written in Rust from the HTML
+Standard. It passes the html5lib tokenizer tests and the web-platform-tests
+tree-construction tests that don't need JavaScript, and on 50 real pages it
+builds the same trees as lexbor, the C parser selectolax uses, about twice
+as fast. Then the whole query runs in Rust too, and Python gets a finished
+list of strings rather than an object for every element along the way. The
 GIL is released while it works, so threads parse in parallel.
 
 `bench/parse.py` pulls every price, title and link out of a generated shop
@@ -494,13 +496,13 @@ page:
 
 | | 1 MB page | 10 MB page |
 |---|---|---|
-| Netweir | 5.0 ms | 61 ms |
-| selectolax | 5.3 ms | 64 ms |
-| BeautifulSoup (lxml) | 196 ms | 2.3 s |
-| lxml + cssselect | 347 ms | 82 s |
-| parsel | 353 ms | 82 s |
+| Netweir | 3.0 ms | 31 ms |
+| selectolax | 5.7 ms | 64 ms |
+| BeautifulSoup (lxml) | 177 ms | 2.0 s |
+| lxml + cssselect | 300 ms | 54 s |
+| parsel | 297 ms | 54 s |
 
-Measured on an Apple M-series laptop with Python 3.14. The lead over selectolax is small, because both parse with lexbor, and it comes from doing the extraction in Rust. On other machines the two can swap places by a few percent; on CI's Linux runners they do. Run it yourself:
+Measured on an Apple M-series laptop with Python 3.14. Run it yourself:
 `uv run --group bench python bench/parse.py`.
 
 XPath and `find_all` are a different story, because the libraries people
@@ -509,13 +511,13 @@ asks six XPath questions, or six Beautiful Soup ones:
 
 | | 1 MB page | 3 MB page |
 |---|---|---|
-| Netweir, XPath | 9.9 ms | 33 ms |
-| lxml, XPath | 809 ms | 8.8 s |
-| parsel, XPath | 814 ms | 8.8 s |
-| Netweir, `find_all` | 9.4 ms | 29 ms |
-| Beautiful Soup, `find_all` | 170 ms | 515 ms |
+| Netweir, XPath | 7.5 ms | 22 ms |
+| lxml, XPath | 824 ms | 8.4 s |
+| parsel, XPath | 823 ms | 8.5 s |
+| Netweir, `find_all` | 7.7 ms | 23 ms |
+| Beautiful Soup, `find_all` | 149 ms | 462 ms |
 
-Look at lxml across the row: three times the page took eleven times as long.
+Look at lxml across the row: three times the page took ten times as long.
 Netweir builds a flat index of the document on the first query, so `//x` is
 a scan over a few arrays, and its time grows with the page and no faster.
 

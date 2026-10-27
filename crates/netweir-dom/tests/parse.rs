@@ -128,14 +128,28 @@ fn chunked_parse_matches_whole_parse() {
 }
 
 #[test]
-fn deep_nesting_is_stopped_by_the_budget() {
-    // Takes many seconds unbounded.
-    let html = "<div>".repeat(200_000);
+fn a_budget_stops_a_parse_that_runs_long() {
+    let html = "<div><b>x</b> y</div>".repeat(200_000);
     let start = Instant::now();
-    let err = Document::parse_within(&html, Duration::from_millis(200)).unwrap_err();
+    let err = Document::parse_within(&html, Duration::from_micros(100)).unwrap_err();
     assert!(err.parsed < html.len());
     assert!(
         start.elapsed() < Duration::from_secs(3),
+        "took {:?}",
+        start.elapsed()
+    );
+}
+
+/// 200,000 unclosed divs took lexbor many seconds (each start tag scanned
+/// the open elements); the parser now takes them in linear time.
+#[test]
+fn deep_nesting_parses_in_linear_time() {
+    let html = "<div>".repeat(200_000);
+    let start = Instant::now();
+    let doc = Document::parse_within(&html, Duration::from_secs(10)).unwrap();
+    assert_eq!(doc.root().descendants().count(), 200_000 + 3);
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
         "took {:?}",
         start.elapsed()
     );

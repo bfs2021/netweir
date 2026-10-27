@@ -801,7 +801,7 @@ def version(args) -> int:
         ("Python", sys.version.replace("\n", " ")),
         ("Platform", platform.platform()),
         ("Rust", info["rustc"]),
-        ("lexbor", info["lexbor"]),
+        ("Parser", info["parser"]),
         ("Profiles", profiles),
     ]
     for name, value in rows:
