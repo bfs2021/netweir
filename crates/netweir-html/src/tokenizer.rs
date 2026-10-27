@@ -253,6 +253,10 @@ pub struct Tokenizer<'a> {
     /// Whether plain tags take [`Tokenizer::fast_tag`]; off only in the
     /// test that checks it against the state machine.
     fast: bool,
+
+    /// When to give up, checked every few thousand steps.
+    deadline: Option<std::time::Instant>,
+    timed_out: bool,
 }
 
 const fn is_space(b: u8) -> bool {
@@ -287,7 +291,24 @@ impl<'a> Tokenizer<'a> {
             system_id: None,
             force_quirks: false,
             fast: true,
+            deadline: None,
+            timed_out: false,
         }
+    }
+
+    /// Stops `run` once `deadline` has passed; [`Tokenizer::timed_out`]
+    /// says whether it did.
+    pub fn set_deadline(&mut self, deadline: std::time::Instant) {
+        self.deadline = Some(deadline);
+    }
+
+    pub fn timed_out(&self) -> bool {
+        self.timed_out
+    }
+
+    /// How far into the input it got.
+    pub fn position(&self) -> usize {
+        self.pos
     }
 
     pub fn set_text_mode(&mut self, mode: TextMode) {
@@ -765,7 +786,15 @@ impl<'a> Tokenizer<'a> {
     pub fn run<S: Sink>(&mut self, sink: &mut S) {
         let input = self.input;
         let bytes = input.as_bytes();
+        let mut steps: u32 = 0;
         loop {
+            if let Some(deadline) = self.deadline {
+                steps = steps.wrapping_add(1);
+                if steps.is_multiple_of(4096) && std::time::Instant::now() > deadline {
+                    self.timed_out = true;
+                    return;
+                }
+            }
             match self.state {
                 State::Data => {
                     let rest = &bytes[self.pos..];

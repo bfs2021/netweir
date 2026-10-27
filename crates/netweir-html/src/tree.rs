@@ -2797,29 +2797,115 @@ impl Sink for TreeBuilder {
     }
 }
 
+/// How to parse.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Options {
+    /// As a browser with JavaScript on: `<noscript>` holds raw text.
+    pub scripting: bool,
+    /// Give up after this long. Some inputs are slow by design (the spec
+    /// makes deeply misnested markup cost more), so a crawler parsing
+    /// pages it doesn't control should set one.
+    pub budget: Option<std::time::Duration>,
+}
+
+/// Why a parse returned no document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseError {
+    /// The input is over [`crate::MAX_INPUT`] bytes.
+    TooLarge { len: usize },
+    /// The budget ran out after `parsed` bytes.
+    Timeout {
+        budget: std::time::Duration,
+        parsed: usize,
+    },
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseError::TooLarge { len } => write!(
+                f,
+                "{len} bytes of HTML is over the {} byte limit",
+                crate::MAX_INPUT
+            ),
+            ParseError::Timeout { budget, parsed } => write!(
+                f,
+                "parsing took longer than {budget:?} (gave up after {parsed} bytes)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
+
 /// Parses a whole document.
+///
+/// # Panics
+/// On input over [`crate::MAX_INPUT`] bytes; [`parse_with`] returns an
+/// error instead.
 pub fn parse(html: &str, scripting: bool) -> Document {
-    let mut builder = TreeBuilder::new(html.len(), scripting);
-    builder.doc.scripting = scripting;
-    let input = source(&mut builder, html);
-    Tokenizer::new(input).run(&mut builder);
-    builder.doc
+    parse_with(
+        html,
+        Options {
+            scripting,
+            budget: None,
+        },
+    )
+    .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Parses a whole document, within a size limit and an optional budget.
+pub fn parse_with(html: &str, options: Options) -> Result<Document, ParseError> {
+    run(html, options, None)
 }
 
 /// Parses `html` as the contents of an element named `context` in
 /// namespace `ns`, as `innerHTML` does.
+///
+/// # Panics
+/// As [`parse`].
 pub fn parse_fragment(html: &str, ns: Ns, context: &str, scripting: bool) -> Document {
-    let mut builder = TreeBuilder::new(html.len(), scripting);
-    builder.doc.scripting = scripting;
+    run(
+        html,
+        Options {
+            scripting,
+            budget: None,
+        },
+        Some((ns, context)),
+    )
+    .unwrap_or_else(|e| panic!("{e}"))
+}
+
+fn run(html: &str, options: Options, fragment: Option<(Ns, &str)>) -> Result<Document, ParseError> {
+    if html.len() > crate::MAX_INPUT {
+        return Err(ParseError::TooLarge { len: html.len() });
+    }
+    let start = std::time::Instant::now();
+    let mut builder = TreeBuilder::new(html.len(), options.scripting);
+    builder.doc.scripting = options.scripting;
     let input = source(&mut builder, html);
-    let mode = builder.fragment(ns, context);
+    let mode = match fragment {
+        Some((ns, context)) => builder.fragment(ns, context),
+        None => None,
+    };
     let mut tokenizer = Tokenizer::new(input);
     if let Some(mode) = mode {
         tokenizer.set_text_mode(mode);
     }
+    if let Some(budget) = options.budget {
+        tokenizer.set_deadline(start + budget);
+    }
     tokenizer.run(&mut builder);
-    builder.finish_fragment();
-    builder.doc
+    if tokenizer.timed_out() {
+        return Err(ParseError::Timeout {
+            budget: options.budget.unwrap_or_default(),
+            parsed: tokenizer.position(),
+        });
+    }
+    if fragment.is_some() {
+        builder.finish_fragment();
+    }
+    Ok(builder.doc)
 }
 
 /// Gives the document its preprocessed source, and returns it for the
@@ -2834,4 +2920,28 @@ fn source<'a>(builder: &mut TreeBuilder, html: &str) -> &'a str {
     // tokenizer reads them, even though the builder holding them moves.
     // The returned reference doesn't outlive the parse functions above.
     unsafe { &*(builder.doc.src.as_ref() as *const str) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn a_budget_stops_a_long_parse_and_says_how_far_it_got() {
+        let html = "<div><b>x</b> y</div>".repeat(200_000);
+        let tight = Options {
+            budget: Some(Duration::from_micros(50)),
+            ..Options::default()
+        };
+        match parse_with(&html, tight) {
+            Err(ParseError::Timeout { parsed, .. }) => assert!(parsed < html.len()),
+            other => panic!("expected a timeout, got {:?}", other.map(|d| d.len())),
+        }
+        let roomy = Options {
+            budget: Some(Duration::from_secs(60)),
+            ..Options::default()
+        };
+        assert!(parse_with(&html, roomy).is_ok());
+    }
 }
