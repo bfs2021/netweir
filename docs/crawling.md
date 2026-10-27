@@ -61,6 +61,7 @@ netweir.Request(
     callback="item",            # a method name, or a function
     errback="lost",             # called with (request, error) if no response arrives
     meta={"category": "tools"}, # comes back as page.meta
+    cb_kwargs={"shelf": "new"}, # called as item(page, shelf="new"); page.cb_kwargs too
     priority=5,                 # higher first, among one site's requests
     headers={"Accept-Language": "de-DE"},
     dont_filter=False,          # True fetches it even if seen before
